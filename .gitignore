@@ -1,2 +1,3 @@
 target/
-examples/counter/www/pkg/
+examples/*/www/pkg/
+examples/lang-counter/app/target/

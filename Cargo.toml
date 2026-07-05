@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/zumar-core",
+    "crates/zumar-lang",
     "crates/zumar-runtime",
     "examples/counter",
     "examples/todo",

@@ -13,12 +13,16 @@ targeting WasmGC comes later as a frontend that speaks the same protocol.
 - `crates/zumar-core` — vdom, diff, patch protocol. No DOM, no wasm deps.
 - `crates/zumar-runtime` — the model/update/view loop. Still no wasm deps;
   fully testable natively.
-- `examples/counter` — TEA counter compiled to Wasm via wasm-bindgen.
+- `crates/zumar-lang` — the language: lexer, parser, typechecker, Rust
+  backend, `zuc` CLI. WasmGC backend planned behind the same AST.
+- `examples/counter` — TEA counter, hand-written Rust.
 - `examples/todo` — keyed lists, controlled input, form submit, checkboxes.
 - `examples/effects` — clock, stopwatch (model-driven sub lifecycle),
   chained delays, HTTP fetch.
-- `www/zumar.js` — the entire JS half (~190 lines): create nodes, apply
-  patches, delegate events, execute commands, manage interval handles.
+- `examples/lang-counter` — `counter.zu` compiled by `zuc`; the generated
+  crate is committed for inspection.
+- `www/zumar.js` + `www/zumar-wire.js` — the entire JS half: create nodes,
+  apply patches, delegate events, execute commands, decode the wire format.
   Symlinked into each example's `www/`.
 
 ## The protocol
@@ -64,5 +68,34 @@ python3 -m http.server 8765 -d www                    # then open :8765
 1. ~~M1: patch protocol + runtime + counter demo~~ (done 2026-07-05)
 2. ~~M2: keyed child diffing; input/form events with payload envelope~~ (done 2026-07-05)
 3. ~~M3: commands/subscriptions (delay, httpGet, every) — the effects side of TEA~~ (done 2026-07-05)
-4. M4: binary patch encoding, benchmark vs JSON
-5. M5: language frontend targeting WasmGC, emitting the same protocol
+4. ~~M4: binary wire format (3.5–6.7× smaller, 2.7–7.5× faster encode than
+   JSON), `zumar_app!` macro, JSON removed from the boundary entirely~~ (done 2026-07-05)
+5. M5 — the language, staged:
+   - ~~phase 1: zumar-lang v0 frontend (lex/parse/typecheck, total updates)
+     + Rust-emitting backend + `zuc` CLI; `counter.zu` runs in the browser~~ (done 2026-07-05)
+   - phase 2: language growth — msg payloads, `onInput`/forms, keyed `for`
+     over lists (unlocks todo.zu), effects syntax
+   - phase 3: WasmGC-direct backend behind the same AST (drops the Rust
+     toolchain from the user loop; js-string-builtins for the boundary)
+
+## zumar-lang at a glance
+
+```
+app Counter
+model { count: Int }
+init = { count = 0 }
+msg Inc | Dec | Reset
+update Inc = { count = model.count + 1 }
+update Dec = { count = model.count - 1 }
+update Reset = { count = 0 }
+view =
+  div [class "counter"] [
+    button [onClick Dec] [ text "-" ],
+    span [] [ text show(model.count) ],
+    button [onClick Inc] [ text "+" ]
+  ]
+```
+
+`zuc check counter.zu` typechecks (every message must have an update
+equation — no click can hit a hole); `zuc build counter.zu --out app`
+emits a Rust crate speaking the zumar protocol.

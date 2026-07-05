@@ -1,0 +1,9 @@
+[package]
+name = "zumar-lang"
+description = "zumar-lang v0: an Elm-like language that compiles to zumar TEA apps. Frontend (lex/parse/typecheck) + Rust-emitting backend; WasmGC backend planned behind the same AST."
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "zuc"
+path = "src/bin/zuc.rs"

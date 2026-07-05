@@ -1,0 +1,30 @@
+# counter.zu — the first zumar-lang program.
+# Compile: cargo run -p zumar-lang --bin zuc -- build counter.zu --out app
+
+app Counter
+
+model { count: Int }
+
+init = { count = 0 }
+
+msg Inc | Dec | Reset
+
+update Inc = { count = model.count + 1 }
+update Dec = { count = model.count - 1 }
+update Reset = { count = 0 }
+
+view =
+  div [class "counter"] [
+    h1 [] [ text "zumar-lang" ],
+    p [class "sub"] [ text "this page was compiled from counter.zu" ],
+    div [class "row"] [
+      button [onClick Dec] [ text "-" ],
+      span [class "count"] [ text show(model.count) ],
+      button [onClick Inc] [ text "+" ]
+    ],
+    button [class "reset", onClick Reset] [ text "reset" ],
+    p [class "note"] [
+      text (if model.count > 9 then "double digits!" else
+            if 0 - 9 > model.count then "very negative!" else "")
+    ]
+  ]
