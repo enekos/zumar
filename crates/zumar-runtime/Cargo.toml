@@ -1,0 +1,12 @@
+[package]
+name = "zumar-runtime"
+description = "The Elm-architecture program loop: model, update, view, dispatch. Still wasm-free."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+zumar-core = { path = "../zumar-core" }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

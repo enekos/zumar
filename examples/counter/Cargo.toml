@@ -1,0 +1,14 @@
+[package]
+name = "counter"
+description = "zumar counter example — the whole TEA loop over the patch protocol, compiled to Wasm."
+edition.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zumar-core = { path = "../../crates/zumar-core" }
+zumar-runtime = { path = "../../crates/zumar-runtime" }
+wasm-bindgen = "0.2"
+serde_json = { workspace = true }

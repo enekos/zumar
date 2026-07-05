@@ -1,0 +1,11 @@
+[package]
+name = "zumar-core"
+description = "Virtual DOM, diff, and the zumar patch protocol. DOM-free and wasm-free."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
