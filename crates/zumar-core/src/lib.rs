@@ -12,4 +12,7 @@ pub mod vdom;
 
 pub use diff::diff;
 pub use patch::{Patch, SerNode};
-pub use vdom::{collect_events, el, find_handler, text, VElement, VNode};
+pub use vdom::{
+    collect_events, el, find_listener, text, EventPayload, EventSpec, Handler, Listener,
+    VElement, VNode,
+};

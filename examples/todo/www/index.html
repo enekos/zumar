@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zumar — todo</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: start center;
+      background: #12140f; color: #e8e6d9;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+      padding-top: 10vh;
+    }
+    .todo { width: min(28rem, 90vw); }
+    .todo h1 { font-size: 1.8rem; letter-spacing: 0.3em; color: #9db668; text-align: center; }
+    form { display: flex; gap: 0.5rem; margin-bottom: 0.8rem; }
+    input[type="text"] {
+      flex: 1; background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.5rem 0.8rem;
+    }
+    input[type="text"]:focus { outline: none; border-color: #9db668; }
+    button {
+      background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.5rem 0.9rem; cursor: pointer;
+    }
+    button:hover { border-color: #9db668; }
+    .bar { display: flex; justify-content: space-between; align-items: center;
+           color: #6f7362; font-size: 0.8rem; margin-bottom: 0.5rem; }
+    .bar button { font-size: 0.75rem; padding: 0.25rem 0.7rem; color: #6f7362; }
+    ul.todos { list-style: none; padding: 0; margin: 0; }
+    ul.todos li {
+      display: flex; align-items: center; gap: 0.7rem;
+      padding: 0.5rem 0.3rem; border-bottom: 1px solid #1e2318;
+    }
+    ul.todos li span { flex: 1; }
+    ul.todos li.done span { text-decoration: line-through; color: #6f7362; }
+    ul.todos li input[type="checkbox"] { accent-color: #9db668; }
+    button.del { border: none; background: none; color: #6f7362; font-size: 1rem; padding: 0 0.4rem; }
+    button.del:hover { color: #d98c7a; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import init, { App } from "./pkg/todo.js";
+    import { mount } from "./zumar.js";
+
+    await init();
+    mount(new App(), document.getElementById("app"));
+  </script>
+</body>
+</html>

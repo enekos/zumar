@@ -75,8 +75,9 @@ impl App {
     }
 
     /// JSON `{ patches, events }` for one DOM event at `path`.
-    pub fn dispatch(&mut self, path: Vec<u32>, event: String) -> String {
-        serde_json::to_string(&self.program.dispatch(&path, &event)).unwrap()
+    pub fn dispatch(&mut self, path: Vec<u32>, event: String, payload: String) -> String {
+        let payload = serde_json::from_str(&payload).unwrap_or_default();
+        serde_json::to_string(&self.program.dispatch(&path, &event, &payload)).unwrap()
     }
 }
 

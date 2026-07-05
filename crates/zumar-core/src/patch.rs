@@ -46,4 +46,10 @@ pub enum Patch {
     RemoveAttr { path: Vec<u32>, name: String },
     AppendChildren { path: Vec<u32>, nodes: Vec<SerNode> },
     TruncateChildren { path: Vec<u32>, len: u32 },
+    /// Keyed diffing only. Insert `node` so it becomes child `index`.
+    InsertChild { path: Vec<u32>, index: u32, node: SerNode },
+    /// Keyed diffing only. Move child `from` so it becomes child `to`.
+    /// The diff guarantees `from > to`, which makes DOM `insertBefore`
+    /// index-stable when applying.
+    MoveChild { path: Vec<u32>, from: u32, to: u32 },
 }

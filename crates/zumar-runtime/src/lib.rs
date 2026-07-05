@@ -13,7 +13,9 @@
 
 use serde::Serialize;
 
-use zumar_core::{collect_events, diff, find_handler, Patch, SerNode, VNode};
+use zumar_core::{
+    collect_events, diff, find_listener, EventPayload, EventSpec, Patch, SerNode, VNode,
+};
 
 pub struct Program<Model, Msg> {
     model: Model,
@@ -22,19 +24,19 @@ pub struct Program<Model, Msg> {
     current: VNode<Msg>,
 }
 
-/// First render: the full tree plus the event names the shim must delegate.
+/// First render: the full tree plus the event specs the shim must delegate.
 #[derive(Debug, Serialize)]
 pub struct InitialRender {
     pub root: SerNode,
-    pub events: Vec<String>,
+    pub events: Vec<EventSpec>,
 }
 
 /// Result of one dispatch: patches to apply, and the (possibly changed)
-/// set of event names to delegate.
+/// set of event specs to delegate.
 #[derive(Debug, Serialize)]
 pub struct Update {
     pub patches: Vec<Patch>,
-    pub events: Vec<String>,
+    pub events: Vec<EventSpec>,
 }
 
 impl<Model, Msg: Clone> Program<Model, Msg> {
@@ -50,12 +52,15 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
         }
     }
 
-    /// Handle one DOM event. A path with no matching handler (event raced a
-    /// render, or fired on a handler-free subtree) is a no-op, not an error.
-    pub fn dispatch(&mut self, path: &[u32], event: &str) -> Update {
-        let Some(msg) = find_handler(&self.current, path, event).cloned() else {
+    /// Handle one DOM event. A path with no matching listener (event raced
+    /// a render, or fired on a handler-free subtree) is a no-op, not an
+    /// error. `payload` is the standard envelope the shim extracted; the
+    /// listener's handler decides which field, if any, it consumes.
+    pub fn dispatch(&mut self, path: &[u32], event: &str, payload: &EventPayload) -> Update {
+        let Some(listener) = find_listener(&self.current, path, event) else {
             return Update { patches: Vec::new(), events: Vec::new() };
         };
+        let msg = listener.handler.resolve(payload);
         (self.update)(&mut self.model, msg);
         let new = (self.view)(&self.model);
         let patches = diff(&self.current, &new);
@@ -72,7 +77,7 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zumar_core::{el, text};
+    use zumar_core::el;
 
     #[derive(Clone, PartialEq, Debug)]
     enum Msg {
@@ -98,12 +103,15 @@ mod tests {
     #[test]
     fn full_loop_counter() {
         let mut program = Program::new(0, update, view);
+        let none = EventPayload::default();
 
         let init = program.initial_render();
-        assert_eq!(init.events, vec!["click"]);
+        assert_eq!(init.events.len(), 1);
+        assert_eq!(init.events[0].name, "click");
+        assert!(!init.events[0].prevent_default);
 
         // Click the "+" button (third child); event target is its text node.
-        let up = program.dispatch(&[2, 0], "click");
+        let up = program.dispatch(&[2, 0], "click", &none);
         assert_eq!(*program.model(), 1);
         assert_eq!(
             up.patches,
@@ -111,7 +119,7 @@ mod tests {
         );
 
         // Click "-" on the button element itself.
-        let down = program.dispatch(&[0], "click");
+        let down = program.dispatch(&[0], "click", &none);
         assert_eq!(*program.model(), 0);
         assert_eq!(
             down.patches,
@@ -123,7 +131,7 @@ mod tests {
     fn dispatch_without_handler_is_noop() {
         let mut program = Program::new(0, update, view);
         // The span has no click handler and neither does the root div.
-        let up = program.dispatch(&[1], "mouseover");
+        let up = program.dispatch(&[1], "mouseover", &EventPayload::default());
         assert!(up.patches.is_empty());
         assert_eq!(*program.model(), 0);
     }
@@ -133,7 +141,51 @@ mod tests {
         let mut program = Program::new(0, update, view);
         // Path deep inside the "+" button's text node still finds the
         // button's handler.
-        program.dispatch(&[2, 0], "click");
+        program.dispatch(&[2, 0], "click", &EventPayload::default());
         assert_eq!(*program.model(), 1);
+    }
+
+    #[derive(Clone, PartialEq, Debug)]
+    enum FormMsg {
+        Draft(String),
+        Submit,
+    }
+
+    fn form_update(model: &mut String, msg: FormMsg) {
+        match msg {
+            FormMsg::Draft(s) => *model = s,
+            FormMsg::Submit => model.push('!'),
+        }
+    }
+
+    #[allow(clippy::ptr_arg)] // Model = String, and view must be fn(&Model)
+    fn form_view(model: &String) -> VNode<FormMsg> {
+        el("form")
+            .on_submit(FormMsg::Submit)
+            .child(el("input").attr("value", model.clone()).on_input(FormMsg::Draft))
+            .into()
+    }
+
+    #[test]
+    fn payload_value_flows_into_message() {
+        let mut program = Program::new(String::new(), form_update, form_view);
+        let typed = EventPayload { value: Some("hej".into()), ..Default::default() };
+        let up = program.dispatch(&[0], "input", &typed);
+        assert_eq!(program.model(), "hej");
+        // The controlled input's value attr round-trips through the diff.
+        assert_eq!(
+            up.patches,
+            vec![Patch::SetAttr { path: vec![0], name: "value".into(), value: "hej".into() }]
+        );
+    }
+
+    #[test]
+    fn submit_requests_prevent_default() {
+        let program = Program::new(String::new(), form_update, form_view);
+        let init = program.initial_render();
+        let submit = init.events.iter().find(|s| s.name == "submit").unwrap();
+        let input = init.events.iter().find(|s| s.name == "input").unwrap();
+        assert!(submit.prevent_default);
+        assert!(!input.prevent_default);
     }
 }
