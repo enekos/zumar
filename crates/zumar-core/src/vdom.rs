@@ -116,25 +116,55 @@ impl<Msg> VElement<Msg> {
     }
 
     pub fn on(self, event: impl Into<String>, msg: Msg) -> Self {
-        self.listener(event, Listener { handler: Handler::Simple(msg), prevent_default: false })
+        self.listener(
+            event,
+            Listener {
+                handler: Handler::Simple(msg),
+                prevent_default: false,
+            },
+        )
     }
 
     /// "submit" with preventDefault — the form never navigates.
     pub fn on_submit(self, msg: Msg) -> Self {
-        self.listener("submit", Listener { handler: Handler::Simple(msg), prevent_default: true })
+        self.listener(
+            "submit",
+            Listener {
+                handler: Handler::Simple(msg),
+                prevent_default: true,
+            },
+        )
     }
 
     pub fn on_input(self, f: fn(String) -> Msg) -> Self {
-        self.listener("input", Listener { handler: Handler::WithValue(f), prevent_default: false })
+        self.listener(
+            "input",
+            Listener {
+                handler: Handler::WithValue(f),
+                prevent_default: false,
+            },
+        )
     }
 
     /// "change" carrying `event.target.checked` — checkboxes and radios.
     pub fn on_check(self, f: fn(bool) -> Msg) -> Self {
-        self.listener("change", Listener { handler: Handler::WithChecked(f), prevent_default: false })
+        self.listener(
+            "change",
+            Listener {
+                handler: Handler::WithChecked(f),
+                prevent_default: false,
+            },
+        )
     }
 
     pub fn on_keydown(self, f: fn(String) -> Msg) -> Self {
-        self.listener("keydown", Listener { handler: Handler::WithKey(f), prevent_default: false })
+        self.listener(
+            "keydown",
+            Listener {
+                handler: Handler::WithKey(f),
+                prevent_default: false,
+            },
+        )
     }
 
     pub fn child(mut self, node: impl Into<VNode<Msg>>) -> Self {
@@ -196,7 +226,10 @@ pub fn collect_events<Msg>(root: &VNode<Msg>) -> Vec<EventSpec> {
     walk(root, &mut map);
     return map
         .into_iter()
-        .map(|(name, prevent_default)| EventSpec { name, prevent_default })
+        .map(|(name, prevent_default)| EventSpec {
+            name,
+            prevent_default,
+        })
         .collect();
 
     fn walk<Msg>(node: &VNode<Msg>, map: &mut BTreeMap<String, bool>) {

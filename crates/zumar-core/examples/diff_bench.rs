@@ -24,7 +24,10 @@ fn keyed_list(order: impl Iterator<Item = usize>) -> VNode<()> {
 fn deep(depth: usize, label: &str) -> VNode<()> {
     let mut node: VNode<()> = text(label);
     for i in 0..depth {
-        node = el("div").attr("class", format!("level-{i}")).child(node).into();
+        node = el("div")
+            .attr("class", format!("level-{i}"))
+            .child(node)
+            .into();
     }
     node
 }
@@ -42,7 +45,12 @@ fn bench(label: &str, old: &VNode<()>, new: &VNode<()>, iters: u32) {
 fn main() {
     for n in [100, 1_000, 5_000] {
         let stable = keyed_list(0..n);
-        bench(&format!("{n} keyed items, unchanged"), &stable, &stable.clone(), 200);
+        bench(
+            &format!("{n} keyed items, unchanged"),
+            &stable,
+            &stable.clone(),
+            200,
+        );
 
         let mut edited = keyed_list(0..n);
         if let VNode::Element(ul) = &mut edited {
@@ -55,7 +63,12 @@ fn main() {
         bench(&format!("{n} keyed items, 1 edited"), &stable, &edited, 200);
 
         let reversed = keyed_list((0..n).rev());
-        bench(&format!("{n} keyed items, fully reversed"), &stable, &reversed, 20);
+        bench(
+            &format!("{n} keyed items, fully reversed"),
+            &stable,
+            &reversed,
+            20,
+        );
     }
 
     let a = deep(200, "bottom");

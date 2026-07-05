@@ -88,7 +88,11 @@ fn node(buf: &mut Vec<u8>, n: &SerNode) {
             buf.push(0);
             s(buf, text);
         }
-        SerNode::Element { tag, attrs, children } => {
+        SerNode::Element {
+            tag,
+            attrs,
+            children,
+        } => {
             buf.push(1);
             s(buf, tag);
             vu(buf, attrs.len() as u64);
@@ -116,7 +120,11 @@ fn patch(buf: &mut Vec<u8>, p: &Patch) {
             path(buf, pt);
             s(buf, text);
         }
-        Patch::SetAttr { path: pt, name, value } => {
+        Patch::SetAttr {
+            path: pt,
+            name,
+            value,
+        } => {
             buf.push(2);
             path(buf, pt);
             s(buf, name);
@@ -140,7 +148,11 @@ fn patch(buf: &mut Vec<u8>, p: &Patch) {
             path(buf, pt);
             vu(buf, *len as u64);
         }
-        Patch::InsertChild { path: pt, index, node: n } => {
+        Patch::InsertChild {
+            path: pt,
+            index,
+            node: n,
+        } => {
             buf.push(6);
             path(buf, pt);
             vu(buf, *index as u64);
@@ -220,8 +232,14 @@ mod tests {
     #[test]
     fn tiny_update_is_tiny() {
         let up = Update {
-            patches: vec![Patch::SetText { path: vec![1, 0], text: "42".into() }],
-            events: vec![EventSpec { name: "click".into(), prevent_default: false }],
+            patches: vec![Patch::SetText {
+                path: vec![1, 0],
+                text: "42".into(),
+            }],
+            events: vec![EventSpec {
+                name: "click".into(),
+                prevent_default: false,
+            }],
             cmds: vec![],
             subs: vec![],
         };
@@ -229,6 +247,11 @@ mod tests {
         // ver + npatch + tag + path(3) + str(3) + events(1+7) + cmds(1) + subs(1)
         assert!(wire.len() < 25, "wire {} bytes", wire.len());
         let json = serde_json::to_string(&up).unwrap();
-        assert!(wire.len() * 3 < json.len(), "wire {} vs json {}", wire.len(), json.len());
+        assert!(
+            wire.len() * 3 < json.len(),
+            "wire {} vs json {}",
+            wire.len(),
+            json.len()
+        );
     }
 }

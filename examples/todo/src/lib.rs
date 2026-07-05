@@ -36,7 +36,11 @@ fn update(model: &mut Model, msg: Msg) -> Cmds<Msg> {
         Msg::Add => {
             let text = model.draft.trim().to_string();
             if !text.is_empty() {
-                model.todos.push(Todo { id: model.next_id, text, done: false });
+                model.todos.push(Todo {
+                    id: model.next_id,
+                    text,
+                    done: false,
+                });
                 model.next_id += 1;
                 model.draft.clear();
             }
@@ -68,7 +72,12 @@ fn view(model: &Model) -> VNode<Msg> {
                         .on("change", Msg::Toggle(t.id)),
                 )
                 .child(el("span").text(t.text.clone()))
-                .child(el("button").attr("class", "del").on("click", Msg::Delete(t.id)).text("×")),
+                .child(
+                    el("button")
+                        .attr("class", "del")
+                        .on("click", Msg::Delete(t.id))
+                        .text("×"),
+                ),
         );
     }
 
@@ -101,5 +110,13 @@ zumar_runtime::zumar_app!(
     App,
     Model,
     Msg,
-    Program::new(Model { draft: String::new(), todos: Vec::new(), next_id: 1 }, update, view)
+    Program::new(
+        Model {
+            draft: String::new(),
+            todos: Vec::new(),
+            next_id: 1
+        },
+        update,
+        view
+    )
 );

@@ -8,6 +8,26 @@ descriptions. So the runtime + patch protocol is built and stabilized
 **first** (proven with Rust-authored apps), and an Elm-like language
 targeting WasmGC comes later as a frontend that speaks the same protocol.
 
+## Quick start
+
+```sh
+export ZUMAR_HOME=/path/to/zumar   # this repo
+cargo install --path crates/zumar-lang   # installs `zuc`
+
+zuc new myapp
+cd myapp
+zuc dev            # http://127.0.0.1:8900 — edit myapp.zu, saves hot-reload
+```
+
+Compile errors show up Elm-style, in the terminal, while the last good
+build keeps serving:
+
+```
+myapp.zu:11:30: error: model has no field `cuont`
+  11 | update Inc = { count = model.cuont + 1 }
+                                    ^
+```
+
 ## Layout
 
 - `crates/zumar-core` — vdom, diff, patch protocol. No DOM, no wasm deps.
@@ -98,4 +118,36 @@ view =
 
 `zuc check counter.zu` typechecks (every message must have an update
 equation — no click can hit a hole); `zuc build counter.zu --out app`
-emits a Rust crate speaking the zumar protocol.
+emits a Rust crate speaking the zumar protocol; `zuc dev` builds,
+serves, watches, and live-reloads.
+
+## Performance
+
+Measured on `cargo run --release --example diff_bench` / `wire_bench`
+(Apple Silicon):
+
+- Diff, 5,000 keyed items: unchanged 207 µs · one edit 258 µs · **full
+  reversal 1.2 ms** (keyed matcher is O(n log n): candidate queues +
+  Fenwick position tracking, with a reusable-in-place prefix fast path).
+- Wire encoding vs JSON: 3.5–6.7× smaller, 2.7–7.5× faster encode; a
+  typical per-click update is ~40 bytes. No JSON crosses the Wasm
+  boundary in either direction.
+- One boundary crossing per event; JS holds no app state.
+
+## Correctness & security
+
+- **Differential fuzz harness** (`crates/zumar-core/tests/diff_apply.rs`):
+  a pure-Rust patch applier mirroring `zumar.js` op-for-op; thousands of
+  random tree pairs (duplicate keys, mixed keyed/unkeyed, unicode) plus
+  every 4-item keyed permutation pair must converge exactly. Runs in CI.
+- **XSS hardening** in the shim, same policy as elm/virtual-dom: DOM is
+  built only via `createElement`/`createTextNode` (markup in model data is
+  inert); `on*` attributes and `srcdoc` never reach the DOM;
+  `javascript:`/`data:text/html` URLs are dropped from URL attributes
+  (control-char obfuscation included); `<script>` renders inert. Guard
+  logic unit-tested in `www/test-guards.mjs`.
+- Wire decoder is bounds-checked — truncated or garbage messages throw
+  instead of hanging.
+- `zuc`'s parser caps nesting depth (clean error, not a stack overflow),
+  and its dev server refuses path traversal.
+- `#![forbid(unsafe_code)]` on all three crates.

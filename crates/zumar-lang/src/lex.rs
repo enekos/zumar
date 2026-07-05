@@ -13,8 +13,8 @@ pub enum Tok {
     RParen,
     Comma,
     Colon,
-    Eq,     // =
-    EqEq,   // ==
+    Eq,   // =
+    EqEq, // ==
     Pipe,
     Dot,
     Plus,
@@ -77,7 +77,10 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
 
     macro_rules! push {
         ($tok:expr, $pos:expr) => {
-            out.push(Token { tok: $tok, pos: $pos })
+            out.push(Token {
+                tok: $tok,
+                pos: $pos,
+            })
         };
     }
 
@@ -215,6 +218,9 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
             c => return Err(ZuError::at(pos, format!("unexpected character `{c}`"))),
         }
     }
-    out.push(Token { tok: Tok::Eof, pos: Pos { line, col } });
+    out.push(Token {
+        tok: Tok::Eof,
+        pos: Pos { line, col },
+    });
     Ok(out)
 }

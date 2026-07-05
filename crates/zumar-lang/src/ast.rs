@@ -98,7 +98,11 @@ pub struct ZuError {
 
 impl ZuError {
     pub fn at(pos: Pos, msg: impl Into<String>) -> ZuError {
-        ZuError { line: pos.line, col: pos.col, msg: msg.into() }
+        ZuError {
+            line: pos.line,
+            col: pos.col,
+            msg: msg.into(),
+        }
     }
 }
 

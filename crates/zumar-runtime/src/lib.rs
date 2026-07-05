@@ -24,8 +24,8 @@ use zumar_core::{
     collect_events, diff, find_listener, EventPayload, EventSpec, Patch, SerNode, VNode,
 };
 
-use effects::{Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta};
 pub use effects::{delay, every, every_with_now, http_get};
+use effects::{Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta};
 pub use zumar_core::EventPayload as WireEventPayload;
 
 /// Generate the wasm-bindgen app wrapper: constructor + the four boundary
@@ -67,7 +67,11 @@ macro_rules! zumar_app {
                 checked: Option<bool>,
                 key: Option<String>,
             ) -> Vec<u8> {
-                let payload = $crate::WireEventPayload { value, checked, key };
+                let payload = $crate::WireEventPayload {
+                    value,
+                    checked,
+                    key,
+                };
                 self.program.dispatch(&path, &event, &payload).to_bytes()
             }
 
@@ -78,8 +82,12 @@ macro_rules! zumar_app {
                 status: Option<u16>,
                 body: Option<String>,
             ) -> Vec<u8> {
-                let payload =
-                    $crate::effects::FxPayload { ok, status, body, now: None };
+                let payload = $crate::effects::FxPayload {
+                    ok,
+                    status,
+                    body,
+                    now: None,
+                };
                 self.program.resolve(id, &payload).to_bytes()
             }
 
@@ -141,7 +149,12 @@ pub struct Update {
 
 impl Update {
     fn noop() -> Update {
-        Update { patches: Vec::new(), events: Vec::new(), cmds: Vec::new(), subs: Vec::new() }
+        Update {
+            patches: Vec::new(),
+            events: Vec::new(),
+            cmds: Vec::new(),
+            subs: Vec::new(),
+        }
     }
 }
 
@@ -273,7 +286,13 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
             let key = spec.key();
             match self.active_subs.remove(&key) {
                 Some(active) => {
-                    next_active.insert(key, ActiveSub { id: active.id, callback });
+                    next_active.insert(
+                        key,
+                        ActiveSub {
+                            id: active.id,
+                            callback,
+                        },
+                    );
                 }
                 None => {
                     let id = self.fresh_id();
@@ -338,7 +357,10 @@ mod tests {
         assert_eq!(*program.model(), 1);
         assert_eq!(
             up.patches,
-            vec![Patch::SetText { path: vec![1, 0], text: "1".into() }]
+            vec![Patch::SetText {
+                path: vec![1, 0],
+                text: "1".into()
+            }]
         );
 
         // Click "-" on the button element itself.
@@ -346,7 +368,10 @@ mod tests {
         assert_eq!(*program.model(), 0);
         assert_eq!(
             down.patches,
-            vec![Patch::SetText { path: vec![1, 0], text: "0".into() }]
+            vec![Patch::SetText {
+                path: vec![1, 0],
+                text: "0".into()
+            }]
         );
     }
 
@@ -386,20 +411,31 @@ mod tests {
     fn form_view(model: &String) -> VNode<FormMsg> {
         el("form")
             .on_submit(FormMsg::Submit)
-            .child(el("input").attr("value", model.clone()).on_input(FormMsg::Draft))
+            .child(
+                el("input")
+                    .attr("value", model.clone())
+                    .on_input(FormMsg::Draft),
+            )
             .into()
     }
 
     #[test]
     fn payload_value_flows_into_message() {
         let mut program = Program::new(String::new(), form_update, form_view);
-        let typed = EventPayload { value: Some("hej".into()), ..Default::default() };
+        let typed = EventPayload {
+            value: Some("hej".into()),
+            ..Default::default()
+        };
         let up = program.dispatch(&[0], "input", &typed);
         assert_eq!(program.model(), "hej");
         // The controlled input's value attr round-trips through the diff.
         assert_eq!(
             up.patches,
-            vec![Patch::SetAttr { path: vec![0], name: "value".into(), value: "hej".into() }]
+            vec![Patch::SetAttr {
+                path: vec![0],
+                name: "value".into(),
+                value: "hej".into()
+            }]
         );
     }
 
@@ -439,7 +475,13 @@ mod tests {
             FxMsg::Toggle => model.running = !model.running,
             FxMsg::Tick(now) => model.last_now = now,
             FxMsg::Fetch => return vec![http_get("./x.txt", FxMsg::Got)],
-            FxMsg::Got(r) => model.note = if r.ok { r.body } else { format!("err {}", r.status) },
+            FxMsg::Got(r) => {
+                model.note = if r.ok {
+                    r.body
+                } else {
+                    format!("err {}", r.status)
+                }
+            }
         }
         Vec::new()
     }
@@ -478,7 +520,10 @@ mod tests {
         assert_eq!(program.model().note, "done");
         assert_eq!(
             done.patches,
-            vec![Patch::SetText { path: vec![2, 0], text: "done".into() }]
+            vec![Patch::SetText {
+                path: vec![2, 0],
+                text: "done".into()
+            }]
         );
 
         // A command resolves exactly once.
@@ -492,7 +537,12 @@ mod tests {
         program.initial_render();
         // Fetch via update directly (no button in the view for it).
         let fetched = program.step(FxMsg::Fetch);
-        assert_eq!(fetched.cmds[0].spec, effects::CmdSpec::HttpGet { url: "./x.txt".into() });
+        assert_eq!(
+            fetched.cmds[0].spec,
+            effects::CmdSpec::HttpGet {
+                url: "./x.txt".into()
+            }
+        );
 
         let payload = FxPayload {
             ok: Some(true),
@@ -519,16 +569,34 @@ mod tests {
 
         // Fire it twice; the payload clock reaches the model. No lifecycle
         // churn while the model still wants the sub.
-        let tick = program.notify(id, &FxPayload { now: Some(123.0), ..Default::default() });
+        let tick = program.notify(
+            id,
+            &FxPayload {
+                now: Some(123.0),
+                ..Default::default()
+            },
+        );
         assert!(tick.subs.is_empty());
         assert_eq!(program.model().last_now, 123.0);
-        program.notify(id, &FxPayload { now: Some(456.0), ..Default::default() });
+        program.notify(
+            id,
+            &FxPayload {
+                now: Some(456.0),
+                ..Default::default()
+            },
+        );
         assert_eq!(program.model().last_now, 456.0);
 
         // Toggle off -> the interval stops; late fires are no-ops.
         let off = program.dispatch(&[1], "click", &EventPayload::default());
         assert_eq!(off.subs, vec![SubDelta::Stop { id }]);
-        let late = program.notify(id, &FxPayload { now: Some(789.0), ..Default::default() });
+        let late = program.notify(
+            id,
+            &FxPayload {
+                now: Some(789.0),
+                ..Default::default()
+            },
+        );
         assert!(late.patches.is_empty());
         assert_eq!(program.model().last_now, 456.0);
     }
@@ -540,7 +608,11 @@ mod tests {
         assert_eq!(init.cmds.len(), 1);
         program.resolve(
             init.cmds[0].id,
-            &FxPayload { ok: Some(true), body: Some("boot".into()), ..Default::default() },
+            &FxPayload {
+                ok: Some(true),
+                body: Some("boot".into()),
+                ..Default::default()
+            },
         );
         assert_eq!(program.model().note, "boot");
     }

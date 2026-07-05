@@ -24,7 +24,12 @@ use crate::lex::{lex, Tok, Token};
 
 pub fn parse(src: &str) -> Result<App, ZuError> {
     let toks = lex(src)?;
-    Parser { toks, i: 0, depth: 0 }.program()
+    Parser {
+        toks,
+        i: 0,
+        depth: 0,
+    }
+    .program()
 }
 
 /// Recursion guard for `expr`/`element`: pathological nesting must produce
@@ -65,7 +70,10 @@ impl Parser {
         if t.tok == tok {
             Ok(t.pos)
         } else {
-            Err(ZuError::at(t.pos, format!("expected {tok}, found {}", t.tok)))
+            Err(ZuError::at(
+                t.pos,
+                format!("expected {tok}, found {}", t.tok),
+            ))
         }
     }
 
@@ -73,7 +81,10 @@ impl Parser {
         let t = self.next();
         match t.tok {
             Tok::Ident(s) => Ok((s, t.pos)),
-            other => Err(ZuError::at(t.pos, format!("expected {what}, found {other}"))),
+            other => Err(ZuError::at(
+                t.pos,
+                format!("expected {what}, found {other}"),
+            )),
         }
     }
 
@@ -89,7 +100,10 @@ impl Parser {
     fn program(&mut self) -> Result<App, ZuError> {
         let start = self.peek().pos;
         if !self.eat_ident("app") {
-            return Err(ZuError::at(start, "a zumar program starts with `app <Name>`"));
+            return Err(ZuError::at(
+                start,
+                "a zumar program starts with `app <Name>`",
+            ));
         }
         let (name, _) = self.ident("app name")?;
 
@@ -137,14 +151,17 @@ impl Parser {
                         }
                     }
                     other => {
-                        return Err(ZuError::at(
-                            t.pos,
-                            format!("expected a declaration (model/init/msg/update/view), found `{other}`"),
-                        ))
+                        let msg = format!(
+                            "expected a declaration (model/init/msg/update/view), found `{other}`"
+                        );
+                        return Err(ZuError::at(t.pos, msg));
                     }
                 },
                 other => {
-                    return Err(ZuError::at(t.pos, format!("expected a declaration, found {other}")))
+                    return Err(ZuError::at(
+                        t.pos,
+                        format!("expected a declaration, found {other}"),
+                    ))
                 }
             }
         }
@@ -235,7 +252,11 @@ impl Parser {
                     let (msg, _) = self.ident("message name after `onClick`")?;
                     attrs.push(Attr::OnClick { msg, pos });
                 } else {
-                    attrs.push(Attr::Str { name, value: self.expr()?, pos });
+                    attrs.push(Attr::Str {
+                        name,
+                        value: self.expr()?,
+                        pos,
+                    });
                 }
                 if self.peek().tok != Tok::Comma {
                     break;
@@ -262,7 +283,11 @@ impl Parser {
             }
         }
         self.expect(Tok::RBracket)?;
-        Ok(Element { tag, attrs, children })
+        Ok(Element {
+            tag,
+            attrs,
+            children,
+        })
     }
 
     fn expr(&mut self) -> Result<Expr, ZuError> {
@@ -281,7 +306,10 @@ impl Parser {
             }
             let then = self.expr()?;
             if !self.eat_ident("else") {
-                return Err(ZuError::at(self.peek().pos, "expected `else` (zumar `if` is an expression; both branches are required)"));
+                return Err(ZuError::at(
+                    self.peek().pos,
+                    "expected `else` (zumar `if` is an expression; both branches are required)",
+                ));
             }
             let els = self.expr()?;
             return Ok(Expr::If(Box::new(cond), Box::new(then), Box::new(els), pos));

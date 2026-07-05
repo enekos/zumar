@@ -43,18 +43,37 @@ fn view(model: &Model) -> VNode<Msg> {
                 .child(el("button").on("click", Msg::Dec).text("−"))
                 .child(
                     el("span")
-                        .attr("class", if model.count < 0 { "count neg" } else { "count" })
+                        .attr(
+                            "class",
+                            if model.count < 0 {
+                                "count neg"
+                            } else {
+                                "count"
+                            },
+                        )
                         .text(model.count.to_string()),
                 )
                 .child(el("button").on("click", Msg::Inc).text("+")),
         )
-        .child(el("button").attr("class", "reset").on("click", Msg::Reset).text("reset"))
+        .child(
+            el("button")
+                .attr("class", "reset")
+                .on("click", Msg::Reset)
+                .text("reset"),
+        )
         .child(if model.count.abs() >= 10 {
-            el("p").attr("class", "note").child(text("that's a lot of clicks"))
+            el("p")
+                .attr("class", "note")
+                .child(text("that's a lot of clicks"))
         } else {
             el("p").attr("class", "note hidden")
         })
         .into()
 }
 
-zumar_runtime::zumar_app!(App, Model, Msg, Program::new(Model { count: 0 }, update, view));
+zumar_runtime::zumar_app!(
+    App,
+    Model,
+    Msg,
+    Program::new(Model { count: 0 }, update, view)
+);

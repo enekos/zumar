@@ -54,13 +54,19 @@ pub struct FxPayload {
 
 /// Fire `msg` once after `ms` milliseconds.
 pub fn delay<Msg>(ms: u32, msg: Msg) -> Cmd<Msg> {
-    Cmd { spec: CmdSpec::Delay { ms }, callback: CmdCallback::Simple(msg) }
+    Cmd {
+        spec: CmdSpec::Delay { ms },
+        callback: CmdCallback::Simple(msg),
+    }
 }
 
 /// GET `url`; the response (or network error, as `ok: false, status: 0`)
 /// arrives through `f`.
 pub fn http_get<Msg>(url: impl Into<String>, f: fn(HttpResult) -> Msg) -> Cmd<Msg> {
-    Cmd { spec: CmdSpec::HttpGet { url: url.into() }, callback: CmdCallback::WithHttp(f) }
+    Cmd {
+        spec: CmdSpec::HttpGet { url: url.into() },
+        callback: CmdCallback::WithHttp(f),
+    }
 }
 
 /// A long-lived effect derived from model state. `subscriptions(&model)` is
@@ -97,12 +103,18 @@ pub(crate) enum SubCallback<Msg> {
 
 /// Fire `msg` every `ms` milliseconds while the sub is active.
 pub fn every<Msg>(ms: u32, msg: Msg) -> Sub<Msg> {
-    Sub { spec: SubSpec::Every { ms }, callback: SubCallback::Simple(msg) }
+    Sub {
+        spec: SubSpec::Every { ms },
+        callback: SubCallback::Simple(msg),
+    }
 }
 
 /// Like [`every`], but the message carries the shim's epoch-ms clock.
 pub fn every_with_now<Msg>(ms: u32, f: fn(f64) -> Msg) -> Sub<Msg> {
-    Sub { spec: SubSpec::Every { ms }, callback: SubCallback::WithNow(f) }
+    Sub {
+        spec: SubSpec::Every { ms },
+        callback: SubCallback::WithNow(f),
+    }
 }
 
 /// A command instance handed to the shim: execute `spec`, call

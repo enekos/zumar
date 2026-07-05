@@ -80,7 +80,12 @@ fn clock(now_ms: f64) -> String {
         return "--:--:--".into();
     }
     let secs = (now_ms / 1000.0) as u64;
-    format!("{:02}:{:02}:{:02}", (secs / 3600) % 24, (secs / 60) % 60, secs % 60)
+    format!(
+        "{:02}:{:02}:{:02}",
+        (secs / 3600) % 24,
+        (secs / 60) % 60,
+        secs % 60
+    )
 }
 
 fn view(model: &Model) -> VNode<Msg> {
@@ -129,7 +134,8 @@ fn view(model: &Model) -> VNode<Msg> {
             el("section")
                 .child(el("h2").text("http (cmd: httpGet, one at init)"))
                 .child(
-                    el("blockquote").text(model.quote.clone().unwrap_or_else(|| "fetching…".into())),
+                    el("blockquote")
+                        .text(model.quote.clone().unwrap_or_else(|| "fetching…".into())),
                 )
                 .child(el("button").on("click", Msg::Refetch).text("refetch")),
         )

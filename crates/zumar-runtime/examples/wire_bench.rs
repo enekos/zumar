@@ -31,10 +31,22 @@ fn li(label: &str) -> SerNode {
 
 fn events() -> Vec<EventSpec> {
     vec![
-        EventSpec { name: "change".into(), prevent_default: false },
-        EventSpec { name: "click".into(), prevent_default: false },
-        EventSpec { name: "input".into(), prevent_default: false },
-        EventSpec { name: "submit".into(), prevent_default: true },
+        EventSpec {
+            name: "change".into(),
+            prevent_default: false,
+        },
+        EventSpec {
+            name: "click".into(),
+            prevent_default: false,
+        },
+        EventSpec {
+            name: "input".into(),
+            prevent_default: false,
+        },
+        EventSpec {
+            name: "submit".into(),
+            prevent_default: true,
+        },
     ]
 }
 
@@ -74,7 +86,9 @@ fn main() {
         root: SerNode::Element {
             tag: "ul".into(),
             attrs: BTreeMap::from([("class".into(), "todos".into())]),
-            children: (0..500).map(|i| li(&format!("todo item number {i}"))).collect(),
+            children: (0..500)
+                .map(|i| li(&format!("todo item number {i}")))
+                .collect(),
         },
         events: events(),
         cmds: vec![],
@@ -85,7 +99,11 @@ fn main() {
     // 2. Keyed reorder: 40 moves + a handful of content patches.
     let reorder = Update {
         patches: (0..40)
-            .map(|i| Patch::MoveChild { path: vec![3], from: 40 + i, to: i })
+            .map(|i| Patch::MoveChild {
+                path: vec![3],
+                from: 40 + i,
+                to: i,
+            })
             .chain((0..8).map(|i| Patch::SetText {
                 path: vec![3, i, 1, 0],
                 text: format!("relabeled {i}"),
@@ -99,7 +117,10 @@ fn main() {
 
     // 3. Hot path: one setText (every counter click, every keystroke).
     let tiny = Update {
-        patches: vec![Patch::SetText { path: vec![2, 1, 0], text: "42".into() }],
+        patches: vec![Patch::SetText {
+            path: vec![2, 1, 0],
+            text: "42".into(),
+        }],
         events: events(),
         cmds: vec![],
         subs: vec![],

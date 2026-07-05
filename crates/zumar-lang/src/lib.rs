@@ -83,7 +83,11 @@ view =
             "if (model.count > 9) { \"double digits!\".to_string() }",
             "zumar_runtime::zumar_app!(App, Model, Msg,",
         ] {
-            assert!(generated.lib_rs.contains(needle), "missing {needle:?} in:\n{}", generated.lib_rs);
+            assert!(
+                generated.lib_rs.contains(needle),
+                "missing {needle:?} in:\n{}",
+                generated.lib_rs
+            );
         }
     }
 

@@ -265,7 +265,10 @@ mod tests {
         let b: N = el("div").child(el("span").text("2")).into();
         assert_eq!(
             diff(&a, &b),
-            vec![Patch::SetText { path: vec![0, 0], text: "2".into() }]
+            vec![Patch::SetText {
+                path: vec![0, 0],
+                text: "2".into()
+            }]
         );
     }
 
@@ -274,9 +277,20 @@ mod tests {
         let a: N = el("div").attr("class", "x").attr("id", "gone").into();
         let b: N = el("div").attr("class", "y").attr("title", "new").into();
         let patches = diff(&a, &b);
-        assert!(patches.contains(&Patch::SetAttr { path: vec![], name: "class".into(), value: "y".into() }));
-        assert!(patches.contains(&Patch::SetAttr { path: vec![], name: "title".into(), value: "new".into() }));
-        assert!(patches.contains(&Patch::RemoveAttr { path: vec![], name: "id".into() }));
+        assert!(patches.contains(&Patch::SetAttr {
+            path: vec![],
+            name: "class".into(),
+            value: "y".into()
+        }));
+        assert!(patches.contains(&Patch::SetAttr {
+            path: vec![],
+            name: "title".into(),
+            value: "new".into()
+        }));
+        assert!(patches.contains(&Patch::RemoveAttr {
+            path: vec![],
+            name: "id".into()
+        }));
         assert_eq!(patches.len(), 3);
     }
 
@@ -309,8 +323,16 @@ mod tests {
         assert_eq!(
             patches,
             vec![
-                Patch::MoveChild { path: vec![], from: 2, to: 0 },
-                Patch::MoveChild { path: vec![], from: 2, to: 1 },
+                Patch::MoveChild {
+                    path: vec![],
+                    from: 2,
+                    to: 0
+                },
+                Patch::MoveChild {
+                    path: vec![],
+                    from: 2,
+                    to: 1
+                },
             ]
         );
     }
@@ -321,7 +343,9 @@ mod tests {
         let b = keyed_list(&["a", "b", "c"]);
         let patches = diff(&a, &b);
         assert_eq!(patches.len(), 1);
-        assert!(matches!(&patches[0], Patch::InsertChild { path, index: 1, .. } if path.is_empty()));
+        assert!(
+            matches!(&patches[0], Patch::InsertChild { path, index: 1, .. } if path.is_empty())
+        );
     }
 
     #[test]
@@ -331,8 +355,15 @@ mod tests {
         assert_eq!(
             diff(&a, &b),
             vec![
-                Patch::MoveChild { path: vec![], from: 2, to: 1 },
-                Patch::TruncateChildren { path: vec![], len: 2 },
+                Patch::MoveChild {
+                    path: vec![],
+                    from: 2,
+                    to: 1
+                },
+                Patch::TruncateChildren {
+                    path: vec![],
+                    len: 2
+                },
             ]
         );
     }
@@ -343,19 +374,35 @@ mod tests {
         let b: N = el("ul").child(item("a", "new label")).into();
         assert_eq!(
             diff(&a, &b),
-            vec![Patch::SetText { path: vec![0, 0], text: "new label".into() }]
+            vec![Patch::SetText {
+                path: vec![0, 0],
+                text: "new label".into()
+            }]
         );
     }
 
     #[test]
     fn keyed_moved_node_diffs_at_new_position() {
-        let a: N = el("ul").child(item("a", "a")).child(item("b", "old")).into();
-        let b: N = el("ul").child(item("b", "new")).child(item("a", "a")).into();
+        let a: N = el("ul")
+            .child(item("a", "a"))
+            .child(item("b", "old"))
+            .into();
+        let b: N = el("ul")
+            .child(item("b", "new"))
+            .child(item("a", "a"))
+            .into();
         assert_eq!(
             diff(&a, &b),
             vec![
-                Patch::MoveChild { path: vec![], from: 1, to: 0 },
-                Patch::SetText { path: vec![0, 0], text: "new".into() },
+                Patch::MoveChild {
+                    path: vec![],
+                    from: 1,
+                    to: 0
+                },
+                Patch::SetText {
+                    path: vec![0, 0],
+                    text: "new".into()
+                },
             ]
         );
     }
@@ -365,8 +412,16 @@ mod tests {
         // A stray unkeyed separator between keyed items survives a reorder
         // of its neighbors without churn.
         let sep = || el("hr");
-        let a: N = el("div").child(item("a", "a")).child(sep()).child(item("b", "b")).into();
-        let b: N = el("div").child(item("b", "b")).child(sep()).child(item("a", "a")).into();
+        let a: N = el("div")
+            .child(item("a", "a"))
+            .child(sep())
+            .child(item("b", "b"))
+            .into();
+        let b: N = el("div")
+            .child(item("b", "b"))
+            .child(sep())
+            .child(item("a", "a"))
+            .into();
         let patches = diff(&a, &b);
         assert!(patches.iter().all(|p| matches!(p, Patch::MoveChild { .. })));
     }
@@ -374,11 +429,19 @@ mod tests {
     #[test]
     fn child_list_grows_and_shrinks_at_tail() {
         let a: N = el("ul").child(el("li").text("a")).into();
-        let b: N = el("ul").child(el("li").text("a")).child(el("li").text("b")).into();
-        assert!(matches!(&diff(&a, &b)[0], Patch::AppendChildren { path, nodes } if path.is_empty() && nodes.len() == 1));
+        let b: N = el("ul")
+            .child(el("li").text("a"))
+            .child(el("li").text("b"))
+            .into();
+        assert!(
+            matches!(&diff(&a, &b)[0], Patch::AppendChildren { path, nodes } if path.is_empty() && nodes.len() == 1)
+        );
         assert_eq!(
             diff(&b, &a),
-            vec![Patch::TruncateChildren { path: vec![], len: 1 }]
+            vec![Patch::TruncateChildren {
+                path: vec![],
+                len: 1
+            }]
         );
     }
 }

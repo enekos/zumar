@@ -64,7 +64,10 @@ fn apply(root: &mut SerNode, patches: Vec<Patch>) {
                 children.insert(index as usize, node);
             }
             Patch::MoveChild { path, from, to } => {
-                assert!(from > to, "moveChild must satisfy from > to (got {from} -> {to})");
+                assert!(
+                    from > to,
+                    "moveChild must satisfy from > to (got {from} -> {to})"
+                );
                 let SerNode::Element { children, .. } = node_at(root, &path) else {
                     panic!("moveChild on a text node")
                 };
@@ -124,7 +127,15 @@ fn every_permutation_of_4_keyed_items_converges() {
 #[test]
 fn keyed_subsets_and_supersets_converge() {
     // Grow, shrink, and disjoint replacement, in both directions.
-    let cases: &[&[usize]] = &[&[], &[0], &[0, 1, 2], &[2, 0], &[3, 4, 5], &[1, 3], &[5, 4, 3, 2, 1, 0]];
+    let cases: &[&[usize]] = &[
+        &[],
+        &[0],
+        &[0, 1, 2],
+        &[2, 0],
+        &[3, 4, 5],
+        &[1, 3],
+        &[5, 4, 3, 2, 1, 0],
+    ];
     for a in cases {
         for b in cases {
             assert_converges(&keyed_list(a), &keyed_list(b), &format!("{a:?} -> {b:?}"));

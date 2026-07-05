@@ -1,0 +1,64 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (includes diff fuzz harness)
+        run: cargo test
+      - name: js guard tests
+        run: node www/test-guards.mjs
+
+  wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build examples
+        run: |
+          for ex in counter todo effects; do
+            wasm-pack build examples/$ex --target web --out-dir www/pkg --release
+          done
+      - name: compile counter.zu end-to-end
+        run: |
+          cargo run --release -p zumar-lang --bin zuc -- build \
+            examples/lang-counter/counter.zu --out /tmp/zu-app --zumar "$PWD"
+          wasm-pack build /tmp/zu-app --target web --out-dir /tmp/zu-app/pkg --release
+      - name: wire smoke test through the wasm binary
+        run: |
+          cd examples/effects/www
+          node --input-type=module -e "
+          import { readFile } from 'node:fs/promises';
+          import { decodeInit, decodeUpdate } from './zumar-wire.js';
+          const mod = await import('./pkg/effects.js');
+          const bytes = await readFile(new URL('./pkg/effects_bg.wasm', 'file://' + process.cwd() + '/'));
+          await mod.default({ module_or_path: bytes });
+          const app = new mod.App();
+          const init = decodeInit(app.init());
+          if (init.cmds.length !== 1 || init.subs.length !== 1) throw new Error('bad init');
+          const r = decodeUpdate(app.notify(init.subs[0].id, 45296000));
+          if (r.patches[0].text !== '12:34:56') throw new Error('bad clock patch');
+          console.log('wire smoke ok');
+          "

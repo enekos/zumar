@@ -68,7 +68,10 @@ fn lib_rs(app: &App) -> String {
     // init
     w.push_str("fn init_model() -> Model {\n    Model {\n");
     for (field, expr, _) in &app.init {
-        w.push_str(&format!("        {field}: {},\n", rust_expr(expr, self_ty(app, field))));
+        w.push_str(&format!(
+            "        {field}: {},\n",
+            rust_expr(expr, self_ty(app, field))
+        ));
     }
     w.push_str("    }\n}\n\n");
 
@@ -96,12 +99,17 @@ fn lib_rs(app: &App) -> String {
     w.push_str(&rust_element(&app.view, 1));
     w.push_str("\n        .into()\n}\n\n");
 
-    w.push_str("zumar_runtime::zumar_app!(App, Model, Msg, Program::new(init_model(), update, view));\n");
+    w.push_str(
+        "zumar_runtime::zumar_app!(App, Model, Msg, Program::new(init_model(), update, view));\n",
+    );
     out
 }
 
 fn self_ty(app: &App, field: &str) -> Option<Ty> {
-    app.model.iter().find(|(n, _, _)| n == field).map(|(_, t, _)| *t)
+    app.model
+        .iter()
+        .find(|(n, _, _)| n == field)
+        .map(|(_, t, _)| *t)
 }
 
 fn rust_ty(ty: Ty) -> &'static str {
@@ -113,7 +121,9 @@ fn rust_ty(ty: Ty) -> &'static str {
 }
 
 fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Emit an expression. `ty` is the checked type (post-typecheck it always
@@ -184,7 +194,10 @@ fn rust_element(el: &Element, depth: usize) -> String {
     for child in &el.children {
         match child {
             Child::Text(expr, _) => {
-                s.push_str(&format!("\n{pad}.child(text({}))", rust_expr(expr, Some(Ty::Str))));
+                s.push_str(&format!(
+                    "\n{pad}.child(text({}))",
+                    rust_expr(expr, Some(Ty::Str))
+                ));
             }
             Child::Elem(e) => {
                 s.push_str(&format!("\n{pad}.child({})", rust_element(e, depth + 1)));

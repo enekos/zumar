@@ -26,7 +26,10 @@ pub fn check(app: &App) -> Result<(), ZuError> {
     let mut seen = BTreeSet::new();
     for (name, expr, pos) in &app.init {
         let Some(&want) = fields.get(name.as_str()) else {
-            return Err(ZuError::at(*pos, format!("`init` sets unknown field `{name}`")));
+            return Err(ZuError::at(
+                *pos,
+                format!("`init` sets unknown field `{name}`"),
+            ));
         };
         if !seen.insert(name.as_str()) {
             return Err(ZuError::at(*pos, format!("`init` sets `{name}` twice")));
@@ -35,7 +38,10 @@ pub fn check(app: &App) -> Result<(), ZuError> {
     }
     for (name, _, pos) in &app.model {
         if !seen.contains(name.as_str()) {
-            return Err(ZuError::at(*pos, format!("`init` is missing field `{name}`")));
+            return Err(ZuError::at(
+                *pos,
+                format!("`init` is missing field `{name}`"),
+            ));
         }
     }
 
@@ -43,20 +49,37 @@ pub fn check(app: &App) -> Result<(), ZuError> {
     let mut equations = BTreeSet::new();
     for (msg, record, pos) in &app.updates {
         if !msgs.contains(msg.as_str()) {
-            return Err(ZuError::at(*pos, format!("`update {msg}` refers to an undeclared message")));
+            return Err(ZuError::at(
+                *pos,
+                format!("`update {msg}` refers to an undeclared message"),
+            ));
         }
         if !equations.insert(msg.as_str()) {
-            return Err(ZuError::at(*pos, format!("duplicate `update {msg}` equation")));
+            return Err(ZuError::at(
+                *pos,
+                format!("duplicate `update {msg}` equation"),
+            ));
         }
         let mut set = BTreeSet::new();
         for (name, expr, fpos) in record {
             let Some(&want) = fields.get(name.as_str()) else {
-                return Err(ZuError::at(*fpos, format!("`update {msg}` sets unknown field `{name}`")));
+                return Err(ZuError::at(
+                    *fpos,
+                    format!("`update {msg}` sets unknown field `{name}`"),
+                ));
             };
             if !set.insert(name.as_str()) {
-                return Err(ZuError::at(*fpos, format!("`update {msg}` sets `{name}` twice")));
+                return Err(ZuError::at(
+                    *fpos,
+                    format!("`update {msg}` sets `{name}` twice"),
+                ));
             }
-            expect_ty(expr, want, &fields, &format!("`update {msg}`, field `{name}`"))?;
+            expect_ty(
+                expr,
+                want,
+                &fields,
+                &format!("`update {msg}`, field `{name}`"),
+            )?;
         }
     }
     // Totality: every message handled.
@@ -84,7 +107,10 @@ fn check_element(
             }
             Attr::OnClick { msg, pos } => {
                 if !msgs.contains(msg.as_str()) {
-                    return Err(ZuError::at(*pos, format!("`onClick {msg}` refers to an undeclared message")));
+                    return Err(ZuError::at(
+                        *pos,
+                        format!("`onClick {msg}` refers to an undeclared message"),
+                    ));
                 }
             }
         }
@@ -98,16 +124,14 @@ fn check_element(
     Ok(())
 }
 
-fn expect_ty(
-    expr: &Expr,
-    want: Ty,
-    fields: &BTreeMap<&str, Ty>,
-    ctx: &str,
-) -> Result<(), ZuError> {
+fn expect_ty(expr: &Expr, want: Ty, fields: &BTreeMap<&str, Ty>, ctx: &str) -> Result<(), ZuError> {
     let got = infer(expr, fields)?;
     if got != want {
         let pos = pos_of(expr);
-        return Err(ZuError::at(pos, format!("{ctx} expects {want}, but this expression is {got}")));
+        return Err(ZuError::at(
+            pos,
+            format!("{ctx} expects {want}, but this expression is {got}"),
+        ));
     }
     Ok(())
 }
@@ -145,20 +169,28 @@ pub fn infer(expr: &Expr, fields: &BTreeMap<&str, Ty>) -> Result<Ty, ZuError> {
                     if lt != Ty::Str || rt != Ty::Str {
                         return Err(ZuError::at(
                             *pos,
-                            format!("`++` joins Strings, got {lt} and {rt} (use show(..) for numbers)"),
+                            format!(
+                                "`++` joins Strings, got {lt} and {rt} (use show(..) for numbers)"
+                            ),
                         ));
                     }
                     Ok(Ty::Str)
                 }
                 Op::Eq => {
                     if lt != rt {
-                        return Err(ZuError::at(*pos, format!("`==` compares equal types, got {lt} and {rt}")));
+                        return Err(ZuError::at(
+                            *pos,
+                            format!("`==` compares equal types, got {lt} and {rt}"),
+                        ));
                     }
                     Ok(Ty::Bool)
                 }
                 Op::Lt | Op::Gt => {
                     if lt != Ty::Int || rt != Ty::Int {
-                        return Err(ZuError::at(*pos, format!("`<`/`>` compare Ints, got {lt} and {rt}")));
+                        return Err(ZuError::at(
+                            *pos,
+                            format!("`<`/`>` compare Ints, got {lt} and {rt}"),
+                        ));
                     }
                     Ok(Ty::Bool)
                 }
@@ -167,12 +199,18 @@ pub fn infer(expr: &Expr, fields: &BTreeMap<&str, Ty>) -> Result<Ty, ZuError> {
         Expr::If(c, t, e, pos) => {
             let ct = infer(c, fields)?;
             if ct != Ty::Bool {
-                return Err(ZuError::at(*pos, format!("`if` condition must be Bool, got {ct}")));
+                return Err(ZuError::at(
+                    *pos,
+                    format!("`if` condition must be Bool, got {ct}"),
+                ));
             }
             let tt = infer(t, fields)?;
             let et = infer(e, fields)?;
             if tt != et {
-                return Err(ZuError::at(*pos, format!("`if` branches disagree: then is {tt}, else is {et}")));
+                return Err(ZuError::at(
+                    *pos,
+                    format!("`if` branches disagree: then is {tt}, else is {et}"),
+                ));
             }
             Ok(tt)
         }
