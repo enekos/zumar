@@ -57,34 +57,4 @@ fn view(model: &Model) -> VNode<Msg> {
         .into()
 }
 
-#[wasm_bindgen]
-pub struct App {
-    program: Program<Model, Msg>,
-}
-
-#[wasm_bindgen]
-impl App {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> App {
-        App {
-            program: Program::new(Model { count: 0 }, update, view),
-        }
-    }
-
-    /// JSON `{ root, events, cmds, subs }` — the full initial tree.
-    pub fn init(&mut self) -> String {
-        serde_json::to_string(&self.program.initial_render()).unwrap()
-    }
-
-    /// JSON `{ patches, events }` for one DOM event at `path`.
-    pub fn dispatch(&mut self, path: Vec<u32>, event: String, payload: String) -> String {
-        let payload = serde_json::from_str(&payload).unwrap_or_default();
-        serde_json::to_string(&self.program.dispatch(&path, &event, &payload)).unwrap()
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+zumar_runtime::zumar_app!(App, Model, Msg, Program::new(Model { count: 0 }, update, view));

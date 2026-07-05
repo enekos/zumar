@@ -13,6 +13,7 @@
 //! including the full effects lifecycle — is testable natively.
 
 pub mod effects;
+pub mod wire;
 
 use std::collections::BTreeMap;
 
@@ -24,6 +25,81 @@ use zumar_core::{
 
 use effects::{Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta};
 pub use effects::{delay, every, every_with_now, http_get};
+pub use zumar_core::EventPayload as WireEventPayload;
+
+/// Generate the wasm-bindgen app wrapper: constructor + the four boundary
+/// calls, all returning wire-encoded bytes. Payloads arrive as explicit
+/// scalars, so no JSON crosses the boundary in either direction.
+///
+/// The invoking crate must have `wasm_bindgen::prelude::*` in scope and
+/// depend on `wasm-bindgen`.
+///
+/// ```ignore
+/// zumar_app!(App, Model, Msg, {
+///     Program::new(Model::default(), update, view).with_subscriptions(subs)
+/// });
+/// ```
+#[macro_export]
+macro_rules! zumar_app {
+    ($app:ident, $model:ty, $msg:ty, $program:expr) => {
+        #[wasm_bindgen]
+        pub struct $app {
+            program: $crate::Program<$model, $msg>,
+        }
+
+        #[wasm_bindgen]
+        impl $app {
+            #[wasm_bindgen(constructor)]
+            pub fn new() -> $app {
+                $app { program: $program }
+            }
+
+            pub fn init(&mut self) -> Vec<u8> {
+                self.program.initial_render().to_bytes()
+            }
+
+            pub fn dispatch(
+                &mut self,
+                path: Vec<u32>,
+                event: String,
+                value: Option<String>,
+                checked: Option<bool>,
+                key: Option<String>,
+            ) -> Vec<u8> {
+                let payload = $crate::WireEventPayload { value, checked, key };
+                self.program.dispatch(&path, &event, &payload).to_bytes()
+            }
+
+            pub fn resolve(
+                &mut self,
+                id: u32,
+                ok: Option<bool>,
+                status: Option<u16>,
+                body: Option<String>,
+            ) -> Vec<u8> {
+                let payload =
+                    $crate::effects::FxPayload { ok, status, body, now: None };
+                self.program.resolve(id, &payload).to_bytes()
+            }
+
+            pub fn notify(&mut self, id: u32, now: Option<f64>) -> Vec<u8> {
+                let payload = $crate::effects::FxPayload {
+                    ok: None,
+                    status: None,
+                    body: None,
+                    now,
+                };
+                self.program.notify(id, &payload).to_bytes()
+            }
+        }
+
+        impl Default for $app {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+    };
+}
 
 pub struct Program<Model, Msg> {
     model: Model,

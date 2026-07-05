@@ -1,10 +1,14 @@
 // zumar.js — the entire JS half of the framework.
 //
-// Responsibilities: materialize SerNode trees, apply patches, and delegate
-// events. It holds no app state and knows nothing about messages: an event
-// is reported to Wasm as (node path, event name, payload envelope) and the
-// vdom decides what it means. This file is the part a future zumar-lang
-// compiler would keep verbatim. Examples symlink it into their www/.
+// Responsibilities: materialize SerNode trees, apply patches, delegate
+// events, execute commands, manage subscription handles. It holds no app
+// state and knows nothing about messages: an event is reported to Wasm as
+// (node path, event name, payload scalars) and the vdom decides what it
+// means. Render results arrive wire-encoded (see zumar-wire.js); no JSON
+// crosses the boundary in either direction. This file is the part a
+// zumar-lang compiler keeps verbatim. Examples symlink it into their www/.
+
+import { decodeInit, decodeUpdate } from "./zumar-wire.js";
 
 export function mount(app, root) {
   const listening = new Set();
@@ -21,17 +25,17 @@ export function mount(app, root) {
   };
 
   const exec = (cmd) => {
-    const done = (payload) =>
-      step(JSON.parse(app.resolve(cmd.id, JSON.stringify(payload))));
+    const done = (ok, status, body) =>
+      step(decodeUpdate(app.resolve(cmd.id, ok, status, body)));
     const s = cmd.spec;
     switch (s.kind) {
       case "delay":
-        setTimeout(() => done({}), s.ms);
+        setTimeout(() => done(), s.ms);
         break;
       case "httpGet":
         fetch(s.url).then(
-          async (r) => done({ ok: r.ok, status: r.status, body: await r.text() }),
-          (e) => done({ ok: false, status: 0, body: String(e) })
+          async (r) => done(r.ok, r.status, await r.text()),
+          (e) => done(false, 0, String(e))
         );
         break;
       default:
@@ -42,8 +46,7 @@ export function mount(app, root) {
   const subDelta = (d) => {
     if (d.op === "start") {
       if (d.spec.kind === "every") {
-        const fire = () =>
-          step(JSON.parse(app.notify(d.id, JSON.stringify({ now: Date.now() }))));
+        const fire = () => step(decodeUpdate(app.notify(d.id, Date.now())));
         subHandles.set(d.id, setInterval(fire, d.spec.ms));
       } else {
         console.warn("zumar: unknown sub", d.spec);
@@ -63,29 +66,23 @@ export function mount(app, root) {
         const path = pathOf(root, e.target);
         if (path === null) return;
         if (preventDefaults.get(spec.name)) e.preventDefault();
-        step(JSON.parse(
-          app.dispatch(Uint32Array.from(path), spec.name, JSON.stringify(envelope(e)))
-        ));
+        const t = e.target;
+        step(decodeUpdate(app.dispatch(
+          Uint32Array.from(path),
+          spec.name,
+          t && "value" in t ? String(t.value) : undefined,
+          t && typeof t.checked === "boolean" ? t.checked : undefined,
+          typeof e.key === "string" ? e.key : undefined
+        )));
       });
     }
   };
 
-  const init = JSON.parse(app.init());
+  const init = decodeInit(app.init());
   root.replaceChildren(create(init.root));
   ensure(init.events);
   for (const cmd of init.cmds) exec(cmd);
   for (const delta of init.subs) subDelta(delta);
-}
-
-// The standard payload envelope (see zumar-core EventPayload). Fields the
-// target doesn't have are null; the vdom-side handler picks what it needs.
-function envelope(e) {
-  const t = e.target;
-  return {
-    value: t && "value" in t ? String(t.value) : null,
-    checked: t && typeof t.checked === "boolean" ? t.checked : null,
-    key: typeof e.key === "string" ? e.key : null,
-  };
 }
 
 // --- tree materialization ---------------------------------------------

@@ -136,48 +136,11 @@ fn view(model: &Model) -> VNode<Msg> {
         .into()
 }
 
-#[wasm_bindgen]
-pub struct App {
-    program: Program<Model, Msg>,
-}
-
-#[wasm_bindgen]
-impl App {
-    #[wasm_bindgen(constructor)]
-    pub fn new() -> App {
-        App {
-            program: Program::new(Model::default(), update, view)
-                .with_subscriptions(subscriptions)
-                .with_init(vec![http_get("./quote.txt", Msg::Got)]),
-        }
-    }
-
-    /// JSON `{ root, events, cmds, subs }` — the full initial tree.
-    pub fn init(&mut self) -> String {
-        serde_json::to_string(&self.program.initial_render()).unwrap()
-    }
-
-    /// JSON `{ patches, events, cmds, subs }` for one DOM event at `path`.
-    pub fn dispatch(&mut self, path: Vec<u32>, event: String, payload: String) -> String {
-        let payload = serde_json::from_str(&payload).unwrap_or_default();
-        serde_json::to_string(&self.program.dispatch(&path, &event, &payload)).unwrap()
-    }
-
-    /// A command finished; same return shape as dispatch.
-    pub fn resolve(&mut self, id: u32, payload: String) -> String {
-        let payload = serde_json::from_str(&payload).unwrap_or_default();
-        serde_json::to_string(&self.program.resolve(id, &payload)).unwrap()
-    }
-
-    /// A subscription fired; same return shape as dispatch.
-    pub fn notify(&mut self, id: u32, payload: String) -> String {
-        let payload = serde_json::from_str(&payload).unwrap_or_default();
-        serde_json::to_string(&self.program.notify(id, &payload)).unwrap()
-    }
-}
-
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+zumar_runtime::zumar_app!(
+    App,
+    Model,
+    Msg,
+    Program::new(Model::default(), update, view)
+        .with_subscriptions(subscriptions)
+        .with_init(vec![http_get("./quote.txt", Msg::Got)])
+);

@@ -11,4 +11,3 @@ crate-type = ["cdylib", "rlib"]
 zumar-core = { path = "../../crates/zumar-core" }
 zumar-runtime = { path = "../../crates/zumar-runtime" }
 wasm-bindgen = "0.2"
-serde_json = { workspace = true }

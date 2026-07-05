@@ -18,7 +18,6 @@ checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
 name = "counter"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "wasm-bindgen",
  "zumar-core",
  "zumar-runtime",
@@ -28,7 +27,6 @@ dependencies = [
 name = "effects"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "wasm-bindgen",
  "zumar-core",
  "zumar-runtime",
@@ -134,7 +132,6 @@ dependencies = [
 name = "todo"
 version = "0.1.0"
 dependencies = [
- "serde_json",
  "wasm-bindgen",
  "zumar-core",
  "zumar-runtime",
