@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! zumar-lang v0 — an Elm-like language compiling to zumar TEA apps.
 //!
 //! Pipeline: [`parse`] → [`check`] → [`generate`]. The frontend is
@@ -117,6 +118,27 @@ view =
         let src = COUNTER.replace("text show(model.count)", "text (\"n = \" ++ model.count)");
         let err = compile(&src).unwrap_err();
         assert!(err.msg.contains("`++` joins Strings"), "{err}");
+    }
+
+    #[test]
+    fn pathological_nesting_errors_cleanly() {
+        // 5000 nested parens must not overflow the compiler stack.
+        let bomb = format!(
+            "app X\nmodel {{ a: Int }}\ninit = {{ a = {}1{} }}\nmsg M\nupdate M = {{ a = 1 }}\nview = div [] []",
+            "(".repeat(5000),
+            ")".repeat(5000)
+        );
+        let err = compile(&bomb).unwrap_err();
+        assert!(err.msg.contains("nesting deeper"), "{err}");
+
+        // Same for element nesting in view.
+        let deep_view = format!(
+            "app X\nmodel {{ a: Int }}\ninit = {{ a = 0 }}\nmsg M\nupdate M = {{ a = 1 }}\nview = {}div [] []{}",
+            "div [] [ ".repeat(5000),
+            " ]".repeat(5000)
+        );
+        let err = compile(&deep_view).unwrap_err();
+        assert!(err.msg.contains("nesting deeper"), "{err}");
     }
 
     #[test]

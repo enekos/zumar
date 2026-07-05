@@ -24,15 +24,30 @@ use crate::lex::{lex, Tok, Token};
 
 pub fn parse(src: &str) -> Result<App, ZuError> {
     let toks = lex(src)?;
-    Parser { toks, i: 0 }.program()
+    Parser { toks, i: 0, depth: 0 }.program()
 }
+
+/// Recursion guard for `expr`/`element`: pathological nesting must produce
+/// a clean error, not a compiler stack overflow.
+const MAX_DEPTH: usize = 200;
 
 struct Parser {
     toks: Vec<Token>,
     i: usize,
+    depth: usize,
 }
 
 impl Parser {
+    fn descend(&mut self) -> Result<(), ZuError> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err(ZuError::at(
+                self.peek().pos,
+                format!("nesting deeper than {MAX_DEPTH} levels — flatten the expression or view"),
+            ));
+        }
+        Ok(())
+    }
     fn peek(&self) -> &Token {
         &self.toks[self.i]
     }
@@ -203,6 +218,13 @@ impl Parser {
     }
 
     fn element(&mut self) -> Result<Element, ZuError> {
+        self.descend()?;
+        let result = self.element_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn element_inner(&mut self) -> Result<Element, ZuError> {
         let (tag, _) = self.ident("element tag")?;
         self.expect(Tok::LBracket)?;
         let mut attrs = Vec::new();
@@ -244,6 +266,13 @@ impl Parser {
     }
 
     fn expr(&mut self) -> Result<Expr, ZuError> {
+        self.descend()?;
+        let result = self.expr_inner();
+        self.depth -= 1;
+        result
+    }
+
+    fn expr_inner(&mut self) -> Result<Expr, ZuError> {
         if matches!(&self.peek().tok, Tok::Ident(s) if s == "if") {
             let pos = self.next().pos;
             let cond = self.expr()?;

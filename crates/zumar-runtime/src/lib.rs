@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! zumar-runtime — the Elm-architecture loop over the zumar patch protocol.
 //!
 //! A [`Program`] owns the model, the current vdom, and the effect ledgers

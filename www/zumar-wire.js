@@ -10,20 +10,23 @@ class Reader {
     this.td = new TextDecoder();
   }
   u8() {
+    if (this.i >= this.b.length) throw new Error("zumar-wire: truncated message");
     return this.b[this.i++];
   }
   vu() {
     let n = 0;
     let shift = 1;
-    for (;;) {
-      const byte = this.b[this.i++];
+    for (let k = 0; k < 10; k++) {
+      const byte = this.u8();
       n += (byte & 0x7f) * shift;
       if ((byte & 0x80) === 0) return n;
       shift *= 128;
     }
+    throw new Error("zumar-wire: varint too long");
   }
   str() {
     const len = this.vu();
+    if (this.i + len > this.b.length) throw new Error("zumar-wire: truncated string");
     const s = this.td.decode(this.b.subarray(this.i, this.i + len));
     this.i += len;
     return s;

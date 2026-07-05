@@ -85,13 +85,49 @@ export function mount(app, root) {
   for (const delta of init.subs) subDelta(delta);
 }
 
+// --- XSS hardening (same policy as elm/virtual-dom) ---------------------
+// The vdom builds DOM exclusively via createElement/createTextNode — no
+// innerHTML anywhere — so markup in model data is inert by construction.
+// What remains is attribute-level injection when *values* flow from user
+// data into sensitive attributes; these guards close that:
+//   - `on*` attributes never reach the DOM (events go through dispatch);
+//   - javascript:/data:text/html URLs are dropped from URL attributes;
+//   - srcdoc is blocked; <script> renders as an inert placeholder.
+
+const URL_ATTRS = new Set(["href", "src", "action", "formaction", "xlink:href"]);
+
+function safeTag(tag) {
+  if (tag.toLowerCase() === "script") {
+    console.warn("zumar: <script> elements are not allowed; rendering placeholder");
+    return "z-blocked";
+  }
+  return tag;
+}
+
+function setSafeAttr(el, name, value) {
+  const n = name.toLowerCase();
+  if (n.startsWith("on") || n === "srcdoc") {
+    console.warn(`zumar: attribute "${name}" is not allowed and was dropped`);
+    return;
+  }
+  if (URL_ATTRS.has(n)) {
+    // Strip control/space chars first: "java\tscript:" is a live vector.
+    const v = value.replace(/[\u0000-\u0020]/g, "").toLowerCase();
+    if (v.startsWith("javascript:") || v.startsWith("data:text/html")) {
+      console.warn(`zumar: unsafe URL in "${name}" was dropped`);
+      return;
+    }
+  }
+  el.setAttribute(name, value);
+}
+
 // --- tree materialization ---------------------------------------------
 
 function create(node) {
   if (node.kind === "text") return document.createTextNode(node.text);
-  const el = document.createElement(node.tag);
+  const el = document.createElement(safeTag(node.tag));
   for (const [name, value] of Object.entries(node.attrs)) {
-    el.setAttribute(name, value);
+    setSafeAttr(el, name, value);
   }
   for (const child of node.children) el.appendChild(create(child));
   return el;
@@ -139,7 +175,7 @@ function apply(root, patches) {
         break;
       case "setAttr": {
         const n = nodeAt(root, p.path);
-        n.setAttribute(p.name, p.value);
+        setSafeAttr(n, p.name, p.value);
         if (p.name === "value" && "value" in n && n.value !== p.value) n.value = p.value;
         if (p.name === "checked" && "checked" in n) n.checked = true;
         break;

@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 //! zumar-core — virtual DOM, diff, and the patch protocol.
 //!
 //! Everything here is DOM-free and wasm-free: the tree is plain data, the
