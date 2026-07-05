@@ -5,6 +5,7 @@ members = [
     "crates/zumar-runtime",
     "examples/counter",
     "examples/todo",
+    "examples/effects",
 ]
 
 [workspace.package]

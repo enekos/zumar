@@ -1,0 +1,14 @@
+[package]
+name = "effects"
+description = "zumar effects example — commands (delay, HTTP) and subscriptions (intervals) with model-driven lifecycle."
+edition.workspace = true
+version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+zumar-core = { path = "../../crates/zumar-core" }
+zumar-runtime = { path = "../../crates/zumar-runtime" }
+wasm-bindgen = "0.2"
+serde_json = { workspace = true }

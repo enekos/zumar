@@ -7,11 +7,52 @@
 // compiler would keep verbatim. Examples symlink it into their www/.
 
 export function mount(app, root) {
-  const init = JSON.parse(app.init());
-  root.replaceChildren(create(init.root));
-
   const listening = new Set();
   const preventDefaults = new Map(); // event name -> bool, refreshed per render
+  const subHandles = new Map(); // sub id -> interval handle
+
+  // Every program step (dispatch/resolve/notify) returns the same shape:
+  // patches to apply, event specs, commands to run, subscription deltas.
+  const step = (result) => {
+    apply(root, result.patches);
+    if (result.events.length) ensure(result.events);
+    for (const cmd of result.cmds) exec(cmd);
+    for (const delta of result.subs) subDelta(delta);
+  };
+
+  const exec = (cmd) => {
+    const done = (payload) =>
+      step(JSON.parse(app.resolve(cmd.id, JSON.stringify(payload))));
+    const s = cmd.spec;
+    switch (s.kind) {
+      case "delay":
+        setTimeout(() => done({}), s.ms);
+        break;
+      case "httpGet":
+        fetch(s.url).then(
+          async (r) => done({ ok: r.ok, status: r.status, body: await r.text() }),
+          (e) => done({ ok: false, status: 0, body: String(e) })
+        );
+        break;
+      default:
+        console.warn("zumar: unknown cmd", s);
+    }
+  };
+
+  const subDelta = (d) => {
+    if (d.op === "start") {
+      if (d.spec.kind === "every") {
+        const fire = () =>
+          step(JSON.parse(app.notify(d.id, JSON.stringify({ now: Date.now() }))));
+        subHandles.set(d.id, setInterval(fire, d.spec.ms));
+      } else {
+        console.warn("zumar: unknown sub", d.spec);
+      }
+    } else {
+      clearInterval(subHandles.get(d.id));
+      subHandles.delete(d.id);
+    }
+  };
 
   const ensure = (specs) => {
     for (const spec of specs) {
@@ -22,15 +63,18 @@ export function mount(app, root) {
         const path = pathOf(root, e.target);
         if (path === null) return;
         if (preventDefaults.get(spec.name)) e.preventDefault();
-        const result = JSON.parse(
+        step(JSON.parse(
           app.dispatch(Uint32Array.from(path), spec.name, JSON.stringify(envelope(e)))
-        );
-        apply(root, result.patches);
-        if (result.events.length) ensure(result.events);
+        ));
       });
     }
   };
+
+  const init = JSON.parse(app.init());
+  root.replaceChildren(create(init.root));
   ensure(init.events);
+  for (const cmd of init.cmds) exec(cmd);
+  for (const delta of init.subs) subDelta(delta);
 }
 
 // The standard payload envelope (see zumar-core EventPayload). Fields the

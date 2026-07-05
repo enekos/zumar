@@ -5,6 +5,7 @@
 use wasm_bindgen::prelude::*;
 
 use zumar_core::{el, text, VNode};
+use zumar_runtime::effects::Cmds;
 use zumar_runtime::Program;
 
 #[derive(Clone)]
@@ -18,12 +19,13 @@ struct Model {
     count: i32,
 }
 
-fn update(model: &mut Model, msg: Msg) {
+fn update(model: &mut Model, msg: Msg) -> Cmds<Msg> {
     match msg {
         Msg::Inc => model.count += 1,
         Msg::Dec => model.count -= 1,
         Msg::Reset => model.count = 0,
     }
+    Vec::new()
 }
 
 fn view(model: &Model) -> VNode<Msg> {
@@ -69,8 +71,8 @@ impl App {
         }
     }
 
-    /// JSON `{ root, events }` — the full initial tree.
-    pub fn init(&self) -> String {
+    /// JSON `{ root, events, cmds, subs }` — the full initial tree.
+    pub fn init(&mut self) -> String {
         serde_json::to_string(&self.program.initial_render()).unwrap()
     }
 
