@@ -9,7 +9,7 @@
 //!          | "update" IDENT IDENT? "=" record
 //!          | "view" "=" element
 //! msgitem := IDENT ty?
-//! ty      := "Int" | "String" | "Bool" | "List" ty | IDENT
+//! ty      := "Int" | "String" | "Bool" | "List" ty | "Maybe" ty | IDENT
 //! record  := "{" (IDENT "=" expr),* "}"
 //! element := IDENT "[" attr,* "]" "[" child,* "]"
 //! attr    := "onClick"|"onChange"|"onSubmit" msgcall
@@ -19,14 +19,16 @@
 //! child   := "text" expr | "for" IDENT "in" expr "{" element "}" | element
 //! expr    := "if" expr "then" expr "else" expr
 //!          | "for" IDENT "in" expr ("where" expr)? "yield" expr
+//!          | "case" expr "of" arm "|" arm     (one none, one some x)
 //!          | cmp
+//! arm     := "none" "->" expr | "some" IDENT "->" expr
 //! cmp     := add (("=="|"!="|"<"|">") add)?
 //! add     := mul (("+"|"-"|"++") mul)*
 //! mul     := unary ("*" unary)*
 //! unary   := "not" unary | postfix
 //! postfix := atom ("." IDENT)*
-//! atom    := INT | STRING | "true" | "false" | IDENT
-//!          | "show"|"length"|"sum"|"toInt"|"reverse" "(" expr ")"
+//! atom    := INT | STRING | "true" | "false" | "none" | IDENT
+//!          | "show"|"length"|"sum"|"toInt"|"reverse"|"head"|"some" "(" expr ")"
 //!          | "nth" "(" expr "," expr "," expr ")"
 //!          | "[" expr,* "]" | "{" recordbody "}" | "(" expr ")" | "-" atom
 //! ```
@@ -223,6 +225,9 @@ impl Parser {
     fn ty(&mut self) -> Result<Ty, ZuError> {
         if self.eat_ident("List") {
             return Ok(Ty::List(Box::new(self.ty()?)));
+        }
+        if self.eat_ident("Maybe") {
+            return Ok(Ty::Maybe(Box::new(self.ty()?)));
         }
         let (name, _) = self.ident("a type")?;
         Ok(match name.as_str() {
@@ -477,7 +482,55 @@ impl Parser {
                 pos,
             });
         }
+        if self.peek_ident_is("case") {
+            return self.case_expr();
+        }
         self.cmp()
+    }
+
+    /// `case <scrut> of none -> <e> | some <x> -> <e>` — arms in either
+    /// order, exactly one `none` and one `some`.
+    fn case_expr(&mut self) -> Result<Expr, ZuError> {
+        let pos = self.next().pos; // `case`
+        let scrut = self.expr()?;
+        if !self.eat_ident("of") {
+            return Err(ZuError::at(
+                self.peek().pos,
+                "expected `of` after the `case` scrutinee",
+            ));
+        }
+        let mut none_arm = None;
+        let mut some = None;
+        for i in 0..2 {
+            if i == 1 {
+                self.expect(Tok::Pipe)?;
+            }
+            if self.eat_ident("none") {
+                self.expect(Tok::Arrow)?;
+                if none_arm.replace(self.expr()?).is_some() {
+                    return Err(ZuError::at(pos, "duplicate `none` arm"));
+                }
+            } else if self.eat_ident("some") {
+                let (var, _) = self.ident("variable after `some`")?;
+                self.expect(Tok::Arrow)?;
+                if some.replace((var, self.expr()?)).is_some() {
+                    return Err(ZuError::at(pos, "duplicate `some` arm"));
+                }
+            } else {
+                return Err(ZuError::at(self.peek().pos, "expected `none` or `some x`"));
+            }
+        }
+        let none_arm =
+            none_arm.ok_or_else(|| ZuError::at(pos, "`case` is missing the `none` arm"))?;
+        let (some_var, some_arm) =
+            some.ok_or_else(|| ZuError::at(pos, "`case` is missing the `some` arm"))?;
+        Ok(Expr::Case {
+            scrut: Box::new(scrut),
+            none_arm: Box::new(none_arm),
+            some_var,
+            some_arm: Box::new(some_arm),
+            pos,
+        })
     }
 
     fn cmp(&mut self) -> Result<Expr, ZuError> {
@@ -576,6 +629,9 @@ impl Parser {
                 "sum" => Ok(Expr::Sum(Box::new(self.paren_arg()?), t.pos)),
                 "toInt" => Ok(Expr::ToInt(Box::new(self.paren_arg()?), t.pos)),
                 "reverse" => Ok(Expr::Reverse(Box::new(self.paren_arg()?), t.pos)),
+                "head" => Ok(Expr::Head(Box::new(self.paren_arg()?), t.pos)),
+                "none" => Ok(Expr::None(t.pos)),
+                "some" => Ok(Expr::Some(Box::new(self.paren_arg()?), t.pos)),
                 "nth" => {
                     let args = self.paren_args()?;
                     let [list, index, default] = <[Expr; 3]>::try_from(args).map_err(|v| {

@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>zumar-lang — queue.zu</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: start center;
+      background: #12140f; color: #e8e6d9;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; padding-top: 9vh;
+    }
+    .queue { width: min(28rem, 90vw); }
+    .queue h1 { font-size: 1.8rem; letter-spacing: 0.2em; color: #c48fd9; margin-bottom: 0.3rem; }
+    .next { font-size: 1.1rem; color: #c48fd9; margin-bottom: 0.9rem; min-height: 1.4em; }
+    form { display: flex; gap: 0.5rem; margin-bottom: 0.6rem; }
+    input[type="text"] {
+      flex: 1; background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.5rem 0.8rem;
+    }
+    input[type="text"]:focus { outline: none; border-color: #c48fd9; }
+    button {
+      background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.5rem 0.9rem; cursor: pointer;
+    }
+    button:hover { border-color: #c48fd9; }
+    .pop { font-size: 0.8rem; color: #6f7362; }
+    .count { color: #6f7362; font-size: 0.8rem; margin: 0.6rem 0 0.3rem; }
+    ul.jobs { list-style: decimal inside; padding: 0; margin: 0; }
+    ul.jobs li { padding: 0.4rem 0.2rem; border-bottom: 1px solid #1e2318; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import init, { App } from "./pkg/queue.js";
+    import { mount } from "./zumar.js";
+    await init();
+    mount(new App(), document.getElementById("app"));
+  </script>
+</body>
+</html>

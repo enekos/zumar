@@ -1,0 +1,51 @@
+# queue.zu — Maybe + case (phase 2.2).
+# The "next up" line is a total case over head(queue): there's no way to
+# read the front of an empty list without handling the empty arm — the
+# compiler makes you write both branches.
+
+app Queue
+
+record Job { id: Int, label: String }
+
+model { draft: String, jobs: List Job, seq: Int }
+
+init = { draft = "", jobs = [], seq = 1 }
+
+msg Draft String | Enqueue | Dequeue
+
+update Draft s = { draft = s }
+
+update Enqueue = {
+  jobs = model.jobs ++ [{ id = model.seq, label = model.draft }],
+  seq = model.seq + 1,
+  draft = ""
+}
+
+# Drop the front job: keep everything whose id isn't the head's id.
+# The head might not exist, so the comparison goes through a total case.
+update Dequeue = {
+  jobs = for j in model.jobs
+         where (case head(model.jobs) of none -> false | some h -> j.id != h.id)
+         yield j
+}
+
+view =
+  div [class "queue"] [
+    h1 [] [ text "queue" ],
+    div [class "next"] [
+      text (case head(model.jobs) of
+              none -> "nothing queued"
+              | some j -> "next up: " ++ j.label)
+    ],
+    form [onSubmit Enqueue] [
+      input [type "text", placeholder "a job", value model.draft, onInput Draft] [],
+      button [type "submit"] [ text "enqueue" ]
+    ],
+    button [class "pop", onClick Dequeue] [ text "dequeue front" ],
+    div [class "count"] [ text (show(length(model.jobs)) ++ " waiting") ],
+    ul [class "jobs"] [
+      for j in model.jobs {
+        li [key show(j.id)] [ text j.label ]
+      }
+    ]
+  ]

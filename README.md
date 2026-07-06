@@ -87,17 +87,29 @@ See `examples/lang-todo/todo.zu` for the whole thing.
 `zuc check` typechecks, `zuc build` emits a Rust crate, `zuc dev` builds,
 serves, watches and live-reloads.
 
-List helpers: `length`, `sum` (over a `List Int`), `reverse`, and
-`nth(list, i, default)` — total, returning the default when the index is
-out of range, since there's no `Maybe` type yet. `toInt(s)` parses a
-`String` to `Int` (0 on failure), which is what makes numeric text inputs
-work — see `examples/lang-expenses`.
+List helpers: `length`, `sum` (over a `List Int`), `reverse`, `nth(list, i,
+default)`, and `head(list) -> Maybe T`. `toInt(s)` parses a `String` to
+`Int` (0 on failure), which is what makes numeric text inputs work — see
+`examples/lang-expenses`.
+
+`Maybe T` is a built-in optional (Rust `Option` under the hood), built with
+`some(x)` / `none` and taken apart with `case`, which must handle both arms:
+
+```
+text (case head(model.jobs) of
+        none -> "nothing queued"
+        | some j -> "next up: " ++ j.label)
+```
+
+So reading the front of a possibly-empty list can't skip the empty case —
+the same totality rule as messages, extended to optionals. See
+`examples/lang-queue`.
 
 ### Not there yet
 
-No general `fold`/lambdas (only the fixed helpers above), and no sum types,
-so error-free indexing leans on a default rather than a `Maybe`. Those, plus
-effects syntax in the language, come before or alongside the WasmGC backend.
+No *user-defined* sum types or general pattern matching (only the built-in
+`Maybe`/`case`), no `fold`/lambdas, and no effects syntax in the language.
+Those come before or alongside the WasmGC backend.
 
 ## The protocol
 
@@ -125,7 +137,7 @@ verbatim.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
 - `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
-  and lang-counter / lang-todo / lang-expenses (all compiled from `.zu`).
+  and lang-counter / lang-todo / lang-expenses / lang-queue (compiled from `.zu`).
 - `spikes/wasmgc` — a hand-written WasmGC module proving the phase-3 path.
 
 ## Numbers
@@ -165,10 +177,10 @@ python3 -m http.server 8765 -d www
 3. ~~commands and subscriptions~~
 4. ~~binary wire format~~
 5. ~~zumar-lang v0~~ + ~~phase 2: records, lists, payloads, comprehensions
-   (`todo.zu` compiles)~~ + ~~phase 2.1: `sum`, `nth`, `toInt`
-   (`expenses.zu` compiles)~~
-6. next: a WasmGC backend behind the same AST — `spikes/wasmgc` maps the path
-   (precompiled `runtime.wasm` + a small app-module emitter via
-   `wasm-encoder`); sum types / `Maybe` and effects syntax alongside.
+   (`todo.zu`)~~ + ~~phase 2.1: `sum`, `nth`, `toInt` (`expenses.zu`)~~ +
+   ~~phase 2.2: `Maybe` + `case` (`queue.zu`)~~
+6. next: user-defined sum types + general pattern matching (generalizing
+   `case`), effects syntax, then a WasmGC backend behind the same AST —
+   `spikes/wasmgc` maps that path.
 
 MIT.

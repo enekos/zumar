@@ -336,6 +336,78 @@ view = div [] []
         assert!(err.msg.contains("toInt(..) takes a String"), "{err}");
     }
 
+    const QUEUE: &str = r#"
+app Queue
+record Job { id: Int, name: String }
+model { jobs: List Job, seq: Int }
+init = { jobs = [], seq = 1 }
+msg Add | Pop
+update Add = { jobs = model.jobs ++ [{ id = model.seq, name = "job" }], seq = model.seq + 1 }
+update Pop = { jobs = for j in model.jobs where j.id != model.seq yield j }
+view =
+  div [] [
+    span [] [ text (case head(model.jobs) of none -> "empty" | some j -> j.name) ]
+  ]
+"#;
+
+    #[test]
+    fn maybe_and_case_compile_and_lower() {
+        let rs = gen_rs(QUEUE);
+        // head lowers to first().cloned(); case to a match with both arms.
+        assert!(rs.contains(".first().cloned()"), "{rs}");
+        assert!(rs.contains("match"), "{rs}");
+        assert!(rs.contains("None =>"), "{rs}");
+        assert!(rs.contains("Some(j) =>"), "{rs}");
+    }
+
+    #[test]
+    fn maybe_field_becomes_option() {
+        let src = r#"
+app M
+record C { id: Int, face: String }
+model { pick: Maybe C }
+init = { pick = none }
+msg Set
+update Set = { pick = some({ id = 1, face = "A" }) }
+view = div [] [ text (case model.pick of none -> "?" | some c -> c.face) ]
+"#;
+        let rs = gen_rs(src);
+        assert!(rs.contains("pub pick: Option<C>"), "{rs}");
+        assert!(rs.contains("Some(C {"), "{rs}");
+    }
+
+    #[test]
+    fn case_arms_must_agree() {
+        let src = QUEUE.replace(
+            "case head(model.jobs) of none -> \"empty\" | some j -> j.name",
+            "case head(model.jobs) of none -> 0 | some j -> j.name",
+        );
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("`case` arms disagree"), "{err}");
+    }
+
+    #[test]
+    fn case_needs_a_maybe() {
+        let src = QUEUE.replace("case head(model.jobs)", "case model.seq");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("scrutinee must be a Maybe"), "{err}");
+    }
+
+    #[test]
+    fn bare_none_needs_context() {
+        // `none` as its own scrutinee has nothing to fix its element type.
+        let src = r#"
+app N
+model { x: Int }
+init = { x = 0 }
+msg M
+update M = { x = case none of none -> 0 | some y -> y }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("what `none` is"), "{err}");
+    }
+
     #[test]
     fn pathological_nesting_errors_cleanly() {
         let bomb = format!(

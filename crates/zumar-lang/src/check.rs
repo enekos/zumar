@@ -359,6 +359,36 @@ impl Checker {
                 self.expect(default, &elem, env, "nth default")?;
                 Ok(elem)
             }
+            Expr::Head(list, pos) => match self.infer(list, None, env)? {
+                Ty::List(t) => Ok(Ty::Maybe(t)),
+                other => Err(ZuError::at(*pos, format!("head(..) takes a List, got {other}"))),
+            },
+            Expr::None(pos) => match expected {
+                Some(t @ Ty::Maybe(_)) => Ok(t.clone()),
+                _ => Err(ZuError::at(*pos, "can't tell what `none` is here — annotate the field or use it in a typed position")),
+            },
+            Expr::Some(inner, _) => {
+                let hint = match expected {
+                    Some(Ty::Maybe(t)) => Some(t.as_ref().clone()),
+                    _ => None,
+                };
+                let t = self.infer(inner, hint.as_ref(), env)?;
+                Ok(Ty::Maybe(Box::new(t)))
+            }
+            Expr::Case { scrut, none_arm, some_var, some_arm, pos } => {
+                let inner = match self.infer(scrut, None, env)? {
+                    Ty::Maybe(t) => *t,
+                    other => return Err(ZuError::at(*pos, format!("`case` scrutinee must be a Maybe, got {other}"))),
+                };
+                let none_ty = self.infer(none_arm, expected, env)?;
+                let mut some_env = env.clone();
+                some_env.push((some_var.clone(), inner));
+                let some_ty = self.infer(some_arm, expected, &some_env)?;
+                if none_ty != some_ty {
+                    return Err(ZuError::at(*pos, format!("`case` arms disagree: none is {none_ty}, some is {some_ty}")));
+                }
+                Ok(none_ty)
+            }
             Expr::Reverse(inner, pos) => match self.infer(inner, None, env)? {
                 Ty::List(t) => Ok(Ty::List(t)),
                 other => Err(ZuError::at(
@@ -570,7 +600,7 @@ impl Checker {
 
 fn check_ty_refs(ty: &Ty, names: &BTreeSet<String>, pos: Pos) -> Result<(), ZuError> {
     match ty {
-        Ty::List(t) => check_ty_refs(t, names, pos),
+        Ty::List(t) | Ty::Maybe(t) => check_ty_refs(t, names, pos),
         Ty::Record(n) if !names.contains(n) => Err(ZuError::at(pos, format!("unknown type `{n}`"))),
         _ => Ok(()),
     }
@@ -585,6 +615,10 @@ fn pos_of(expr: &Expr) -> Pos {
         | Expr::Sum(_, p)
         | Expr::ToInt(_, p)
         | Expr::Nth(_, _, _, p)
+        | Expr::Head(_, p)
+        | Expr::None(p)
+        | Expr::Some(_, p)
+        | Expr::Case { pos: p, .. }
         | Expr::Reverse(_, p)
         | Expr::Not(_, p)
         | Expr::Bin(_, _, _, p)

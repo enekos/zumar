@@ -343,6 +343,52 @@ impl Gen {
                     elem,
                 )
             }
+            Expr::Head(list, _) => {
+                let list_code = self.emit_operand(list, env);
+                let elem = match self.type_of(list, env) {
+                    Ty::List(t) => *t,
+                    _ => unreachable!("typechecked: list"),
+                };
+                (
+                    format!("({list_code}.first().cloned())"),
+                    Ty::Maybe(Box::new(elem)),
+                )
+            }
+            Expr::None(_) => {
+                let ty = expected.cloned().expect("typechecked: none has a hint");
+                ("None".to_string(), ty)
+            }
+            Expr::Some(inner, _) => {
+                let hint = match expected {
+                    Some(Ty::Maybe(t)) => Some(t.as_ref().clone()),
+                    _ => None,
+                };
+                let (code, ty) = self.emit(inner, hint.as_ref(), env);
+                (format!("Some({code})"), Ty::Maybe(Box::new(ty)))
+            }
+            Expr::Case {
+                scrut,
+                none_arm,
+                some_var,
+                some_arm,
+                ..
+            } => {
+                let (sc, scrut_ty) = self.emit(scrut, None, env);
+                let inner = match scrut_ty {
+                    Ty::Maybe(t) => *t,
+                    _ => unreachable!("typechecked: maybe"),
+                };
+                let (nc, ty) = self.emit(none_arm, expected, env);
+                let mut some_env = env.clone();
+                some_env.push((some_var.clone(), inner));
+                let (some_c, _) = self.emit(some_arm, expected, &some_env);
+                (
+                    format!(
+                        "(match {sc} {{ None => {{ {nc} }} Some({some_var}) => {{ {some_c} }} }})"
+                    ),
+                    ty,
+                )
+            }
             Expr::Reverse(inner, _) => {
                 let (code, ty) = self.emit(inner, expected, env);
                 let d = self.fresh();
@@ -554,6 +600,13 @@ impl Gen {
                 Ty::List(t) => *t,
                 _ => unreachable!(),
             },
+            Expr::Head(list, _) => match self.type_of(list, env) {
+                Ty::List(t) => Ty::Maybe(t),
+                _ => unreachable!(),
+            },
+            Expr::None(_) => Ty::Maybe(Box::new(Ty::Int)),
+            Expr::Some(inner, _) => Ty::Maybe(Box::new(self.type_of(inner, env))),
+            Expr::Case { none_arm, .. } => self.type_of(none_arm, env),
             Expr::Reverse(inner, _) => self.type_of(inner, env),
             Expr::Not(..) => Ty::Bool,
             Expr::Bin(op, l, _, _) => match op {
@@ -592,6 +645,7 @@ fn rust_ty(ty: &Ty) -> String {
         Ty::Str => "String".into(),
         Ty::Bool => "bool".into(),
         Ty::List(t) => format!("Vec<{}>", rust_ty(t)),
+        Ty::Maybe(t) => format!("Option<{}>", rust_ty(t)),
         Ty::Record(n) => n.clone(),
     }
 }

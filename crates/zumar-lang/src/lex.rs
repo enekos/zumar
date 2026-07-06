@@ -21,6 +21,7 @@ pub enum Tok {
     Plus,
     PlusPlus,
     Minus,
+    Arrow, // ->
     Star,
     Lt,
     Gt,
@@ -54,6 +55,7 @@ impl std::fmt::Display for Tok {
                     Tok::Plus => "+",
                     Tok::PlusPlus => "++",
                     Tok::Minus => "-",
+                    Tok::Arrow => "->",
                     Tok::Star => "*",
                     Tok::Lt => "<",
                     Tok::Gt => ">",
@@ -107,7 +109,7 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
                     }
                 }
             }
-            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '|' | '.' | '*' | '<' | '>' | '-' => {
+            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '|' | '.' | '*' | '<' | '>' => {
                 chars.next();
                 col += 1;
                 push!(
@@ -125,11 +127,21 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
                         '*' => Tok::Star,
                         '<' => Tok::Lt,
                         '>' => Tok::Gt,
-                        '-' => Tok::Minus,
                         _ => unreachable!(),
                     },
                     pos
                 );
+            }
+            '-' => {
+                chars.next();
+                col += 1;
+                if chars.peek() == Some(&'>') {
+                    chars.next();
+                    col += 1;
+                    push!(Tok::Arrow, pos);
+                } else {
+                    push!(Tok::Minus, pos);
+                }
             }
             '=' => {
                 chars.next();

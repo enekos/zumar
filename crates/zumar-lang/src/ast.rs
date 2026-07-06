@@ -17,6 +17,8 @@ pub enum Ty {
     Str,
     Bool,
     List(Box<Ty>),
+    /// `Maybe T` — an optional, backed by Rust `Option<T>`.
+    Maybe(Box<Ty>),
     /// A named record — either a `record` declaration or the reserved
     /// `Model` synthesized from the `model {}` block.
     Record(String),
@@ -29,6 +31,7 @@ impl std::fmt::Display for Ty {
             Ty::Str => f.write_str("String"),
             Ty::Bool => f.write_str("Bool"),
             Ty::List(t) => write!(f, "List {t}"),
+            Ty::Maybe(t) => write!(f, "Maybe {t}"),
             Ty::Record(n) => f.write_str(n),
         }
     }
@@ -53,6 +56,20 @@ pub enum Expr {
     ToInt(Box<Expr>, Pos),
     /// `nth(<List T>, <Int>, <T default>)` -> T (default when out of bounds)
     Nth(Box<Expr>, Box<Expr>, Box<Expr>, Pos),
+    /// `head(<List T>)` -> Maybe T (none when empty)
+    Head(Box<Expr>, Pos),
+    /// `none` -> Maybe T (type from context)
+    None(Pos),
+    /// `some(<T>)` -> Maybe T
+    Some(Box<Expr>, Pos),
+    /// `case scrut of none -> e | some x -> e` — total: both arms required.
+    Case {
+        scrut: Box<Expr>,
+        none_arm: Box<Expr>,
+        some_var: String,
+        some_arm: Box<Expr>,
+        pos: Pos,
+    },
     /// `reverse(<List T>)` -> List T
     Reverse(Box<Expr>, Pos),
     /// `not <Bool>`
