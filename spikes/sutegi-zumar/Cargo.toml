@@ -1,0 +1,16 @@
+# P0 spike: counter.zu live from a sutegi server — one zumar Program per
+# WebSocket connection, wire frames over sutegi-ws to zumar.js in the
+# browser. Excluded from the zumar workspace (needs a sibling sutegi
+# checkout, like sutegi's benches/ need aatxe); build from this directory.
+[package]
+name = "sutegi-zumar"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+zumar-core = { path = "../../crates/zumar-core" }
+zumar-runtime = { path = "../../crates/zumar-runtime" }
+sutegi = { path = "../../../sutegi/crates/sutegi", default-features = false, features = ["ws"] }
+
+[workspace]

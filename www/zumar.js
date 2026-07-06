@@ -24,9 +24,14 @@ export function mount(app, root) {
     for (const delta of result.subs) subDelta(delta);
   };
 
+  // Sync transports (wasm, gc) return update bytes from every call; async
+  // transports (live) return nothing and push updates via app.onUpdate.
+  const maybe = (bytes) => {
+    if (bytes) step(decodeUpdate(bytes));
+  };
+
   const exec = (cmd) => {
-    const done = (ok, status, body) =>
-      step(decodeUpdate(app.resolve(cmd.id, ok, status, body)));
+    const done = (ok, status, body) => maybe(app.resolve(cmd.id, ok, status, body));
     const s = cmd.spec;
     switch (s.kind) {
       case "delay":
@@ -46,7 +51,7 @@ export function mount(app, root) {
   const subDelta = (d) => {
     if (d.op === "start") {
       if (d.spec.kind === "every") {
-        const fire = () => step(decodeUpdate(app.notify(d.id, Date.now())));
+        const fire = () => maybe(app.notify(d.id, Date.now()));
         subHandles.set(d.id, setInterval(fire, d.spec.ms));
       } else {
         console.warn("zumar: unknown sub", d.spec);
@@ -67,13 +72,13 @@ export function mount(app, root) {
         if (path === null) return;
         if (preventDefaults.get(spec.name)) e.preventDefault();
         const t = e.target;
-        step(decodeUpdate(app.dispatch(
+        maybe(app.dispatch(
           Uint32Array.from(path),
           spec.name,
           t && "value" in t ? String(t.value) : undefined,
           t && typeof t.checked === "boolean" ? t.checked : undefined,
           typeof e.key === "string" ? e.key : undefined
-        )));
+        ));
       });
     }
   };
@@ -83,6 +88,7 @@ export function mount(app, root) {
   ensure(init.events);
   for (const cmd of init.cmds) exec(cmd);
   for (const delta of init.subs) subDelta(delta);
+  if (app.onUpdate) app.onUpdate((bytes) => step(decodeUpdate(bytes)));
 }
 
 // --- XSS hardening (same policy as elm/virtual-dom) ---------------------
