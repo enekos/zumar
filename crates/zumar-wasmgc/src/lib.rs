@@ -40,10 +40,12 @@ use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, ValueKind, M
 
 const WIRE_VERSION: u8 = 1;
 
-// Memory layout: wire buffer grows from 0; itoa scratch; string constants
-// (active data segment); payload and path staging written by the host.
-const SCRATCH: i32 = 3072;
-const DATA_BASE: i32 = 4096;
+// Memory layout: the wire buffer grows from 0 (up to ~38KB of render);
+// then itoa scratch, staged command ids, string constants (active data
+// segment), and the payload/path staging written by the host.
+const SCRATCH: i32 = 38000;
+const CMD_STAGE: i32 = 39000;
+const DATA_BASE: i32 = 40000;
 const PAYLOAD_BUF: i32 = 56000;
 const PATH_BUF: i32 = 60000;
 
@@ -65,6 +67,9 @@ const G_PATH_BUF: u32 = 2;
 const G_PAYLOAD_BUF: u32 = 3;
 const G_PAYLOAD: u32 = 4;
 const G_PAYLOAD_I64: u32 = 5;
+const G_NEXT_ID: u32 = 6;
+const G_CMD_COUNT: u32 = 7;
+const G_SUBS_ACTIVE: u32 = 8;
 
 // Type index for $str is always first.
 const T_STR: u32 = 0;
@@ -201,6 +206,25 @@ struct DynAttr {
     expr: Expr,
 }
 
+/// A command callsite (`then delay/httpGet` occurrence). Issued ids encode
+/// their callsite (`id = counter * n_sites + site`), so `resolve` recovers
+/// the continuation with `id % n_sites` — no pending table needed.
+enum CmdSite {
+    Delay { ms: i64, msg: u32 },
+    Http { url: String, ctor: u32 },
+}
+
+/// An `every(ms, Msg)` occurrence in the `sub` declaration. `conds` are the
+/// `if` conditions on the path to it (with expected polarity); the sub is
+/// wanted when they all hold. Its id is its index — stable across
+/// start/stop, which is exactly what the shim's handle map wants.
+struct SubSite {
+    ms: i64,
+    msg: u32,
+    clocked: bool,
+    conds: Vec<(Expr, bool)>,
+}
+
 /// A `for` region: an element whose children are generated from a list.
 struct Region {
     path: Vec<u32>,
@@ -226,6 +250,11 @@ struct Emitter<'a> {
     events: BTreeMap<String, bool>,
     /// Temp locals allocated while emitting the init tree.
     init_ctx_locals: Vec<ValType>,
+    cmd_sites: Vec<CmdSite>,
+    /// Callsite indices staged by `init` and by each update arm.
+    init_sites: Vec<usize>,
+    update_sites: Vec<Vec<usize>>,
+    sub_sites: Vec<SubSite>,
 }
 
 impl<'a> Emitter<'a> {
@@ -247,7 +276,7 @@ impl<'a> Emitter<'a> {
         }
         for (name, ty, pos) in &app.model {
             match ty {
-                Ty::Int | Ty::Str => {}
+                Ty::Int | Ty::Str | Ty::Bool => {}
                 Ty::List(inner) if matches!(inner.as_ref(), Ty::Record(_)) => {}
                 _ => return Err(unsupported(*pos, &format!("model field `{name}: {ty}`"))),
             }
@@ -260,24 +289,7 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
-        if let Some(cmd) = app
-            .init_cmds
-            .iter()
-            .chain(app.updates.iter().flat_map(|u| u.cmds.iter()))
-            .next()
-        {
-            let pos = match cmd {
-                zumar_lang::ast::CmdCall::Delay { pos, .. } => *pos,
-                zumar_lang::ast::CmdCall::HttpGet { pos, .. } => *pos,
-            };
-            return Err(unsupported(pos, "effects (`then` commands)"));
-        }
-        if app.subs.is_some() {
-            return Err(unsupported(
-                Pos { line: 1, col: 1 },
-                "effects (`sub` subscriptions)",
-            ));
-        }
+
         let mut e = Emitter {
             app,
             records,
@@ -298,6 +310,10 @@ impl<'a> Emitter<'a> {
             handlers: Vec::new(),
             events: BTreeMap::new(),
             init_ctx_locals: Vec::new(),
+            cmd_sites: Vec::new(),
+            init_sites: Vec::new(),
+            update_sites: Vec::new(),
+            sub_sites: Vec::new(),
         };
         // The init tree needs a Ctx for inline dynamic expressions.
         let mut ctx = Ctx::new(0);
@@ -309,7 +325,79 @@ impl<'a> Emitter<'a> {
         // Deepest-first so bubbling picks the innermost handler.
         e.handlers
             .sort_by_key(|h| std::cmp::Reverse(h.specificity()));
+
+        // Effects: enumerate command callsites (init first, then update
+        // arms in order) and subscription sites with their path conditions.
+        for cmd in &app.init_cmds {
+            let idx = e.cmd_sites.len();
+            let site = e.cmd_site(cmd)?;
+            e.cmd_sites.push(site);
+            e.init_sites.push(idx);
+        }
+        for u in &app.updates {
+            let mut sites = Vec::new();
+            for cmd in &u.cmds {
+                let idx = e.cmd_sites.len();
+                let site = e.cmd_site(cmd)?;
+                e.cmd_sites.push(site);
+                sites.push(idx);
+            }
+            e.update_sites.push(sites);
+        }
+        if let Some(subs) = &app.subs {
+            let mut conds = Vec::new();
+            e.collect_sub_sites(subs, &mut conds);
+        }
         Ok(e)
+    }
+
+    fn cmd_site(&self, cmd: &zumar_lang::ast::CmdCall) -> Result<CmdSite, String> {
+        use zumar_lang::ast::CmdCall;
+        match cmd {
+            CmdCall::Delay { ms, msg, .. } => Ok(CmdSite::Delay {
+                ms: *ms,
+                msg: self.msg_index(msg),
+            }),
+            CmdCall::HttpGet { url, ctor, pos } => {
+                let Expr::Str(url) = url else {
+                    return Err(unsupported(*pos, "computed httpGet urls"));
+                };
+                Ok(CmdSite::Http {
+                    url: url.clone(),
+                    ctor: self.msg_index(ctor),
+                })
+            }
+        }
+    }
+
+    fn collect_sub_sites(
+        &mut self,
+        subs: &zumar_lang::ast::SubExpr,
+        conds: &mut Vec<(Expr, bool)>,
+    ) {
+        use zumar_lang::ast::SubExpr;
+        match subs {
+            SubExpr::List(calls) => {
+                for c in calls {
+                    let msg = self.msg_index(&c.msg);
+                    let clocked = self.app.msgs[msg as usize].payload.is_some();
+                    self.sub_sites.push(SubSite {
+                        ms: c.ms,
+                        msg,
+                        clocked,
+                        conds: conds.clone(),
+                    });
+                }
+            }
+            SubExpr::If(cond, t, f, _) => {
+                conds.push((cond.clone(), true));
+                self.collect_sub_sites(t, conds);
+                conds.pop();
+                conds.push((cond.clone(), false));
+                self.collect_sub_sites(f, conds);
+                conds.pop();
+            }
+        }
     }
 
     // --- type & function index layout ---------------------------------------
@@ -404,6 +492,21 @@ impl<'a> Emitter<'a> {
     }
     fn f_dispatch(&self) -> u32 {
         self.f_update() + 4
+    }
+    fn f_fx_tail(&self) -> u32 {
+        self.f_update() + 5
+    }
+    fn f_resolve(&self) -> u32 {
+        self.f_update() + 6
+    }
+    fn f_notify(&self) -> u32 {
+        self.f_update() + 7
+    }
+    fn t_resolve(&self) -> u32 {
+        self.ft(10 + 2 * self.n_records())
+    }
+    fn t_notify(&self) -> u32 {
+        self.ft(10 + 2 * self.n_records() + 1)
     }
 
     fn field_index(&self, name: &str) -> u32 {
@@ -1413,6 +1516,13 @@ impl<'a> Emitter<'a> {
             types.ty().function([arr, arr], [arr]);
             types.ty().function([arr], [arr]);
         }
+        types.ty().function(
+            [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I32],
+        );
+        types
+            .ty()
+            .function([ValType::I32, ValType::F64], [ValType::I32]);
         module.section(&types);
 
         // Functions.
@@ -1441,6 +1551,9 @@ impl<'a> Emitter<'a> {
         funcs.function(self.t_void()); // boot
         funcs.function(self.t_ret()); // init
         funcs.function(self.t_dispatch()); // dispatch
+        funcs.function(self.t_void()); // fx_tail
+        funcs.function(self.t_resolve()); // resolve
+        funcs.function(self.t_notify()); // notify
         module.section(&funcs);
 
         // Memory.
@@ -1504,6 +1617,16 @@ impl<'a> Emitter<'a> {
             },
             &ConstExpr::i64_const(0),
         );
+        for _ in 0..3 {
+            globals.global(
+                GlobalType {
+                    val_type: ValType::I32,
+                    mutable: true,
+                    shared: false,
+                },
+                &ConstExpr::i32_const(0),
+            );
+        }
         module.section(&globals);
 
         // Exports.
@@ -1513,6 +1636,8 @@ impl<'a> Emitter<'a> {
         exports.export("dispatch", ExportKind::Func, self.f_dispatch());
         exports.export("path_buf", ExportKind::Global, G_PATH_BUF);
         exports.export("payload_buf", ExportKind::Global, G_PAYLOAD_BUF);
+        exports.export("resolve", ExportKind::Func, self.f_resolve());
+        exports.export("notify", ExportKind::Func, self.f_notify());
         module.section(&exports);
 
         module.section(&StartSection {
@@ -1545,6 +1670,9 @@ impl<'a> Emitter<'a> {
         bodies.push(self.fn_boot()?);
         bodies.push(self.fn_init()?);
         bodies.push(self.fn_dispatch()?);
+        bodies.push(self.fn_fx_tail()?);
+        bodies.push(self.fn_resolve()?);
+        bodies.push(self.fn_notify()?);
         let mut code = CodeSection::new();
         for b in &bodies {
             code.function(b);
@@ -2106,7 +2234,7 @@ impl<'a> Emitter<'a> {
             .collect();
         let mut ctx = Ctx::new(1 + nfields as u32);
         let mut ins: Vec<I<'static>> = Vec::new();
-        for u in &updates {
+        for (arm_index, u) in updates.iter().enumerate() {
             let k = self.msg_index(&u.msg);
             if let Some((v, _)) = &u.var {
                 let slot = match self.msg_payload(k) {
@@ -2133,6 +2261,9 @@ impl<'a> Emitter<'a> {
                     struct_type_index: self.model_idx(),
                     field_index: idx,
                 });
+            }
+            for &site in &self.update_sites[arm_index].clone() {
+                Self::stage_cmd(site, self.cmd_sites.len(), &mut ins);
             }
             ins.push(I::Return);
             ins.push(I::End);
@@ -2187,9 +2318,8 @@ impl<'a> Emitter<'a> {
             }
             ins.push(I::Call(self.f_region(j)));
         }
-        for _ in 0..3 {
-            Self::c_wvu(&mut ins, 0); // events, cmds, subs
-        }
+        Self::c_wvu(&mut ins, 0); // events
+        ins.push(I::Call(self.f_fx_tail())); // cmds + sub deltas
         ins.push(I::End);
         Ok(ctx.into_function(&[], &ins))
     }
@@ -2234,8 +2364,10 @@ impl<'a> Emitter<'a> {
             self.c_wstr(&mut ins, &name);
             Self::c_w8(&mut ins, pd as u8);
         }
-        Self::c_wvu(&mut ins, 0);
-        Self::c_wvu(&mut ins, 0);
+        for &site in &self.init_sites.clone() {
+            Self::stage_cmd(site, self.cmd_sites.len(), &mut ins);
+        }
+        ins.push(I::Call(self.f_fx_tail())); // cmds + initial sub starts
         ins.push(I::GlobalGet(G_CURSOR));
         ins.push(I::End);
         // The walk already allocated any temps it needed.
@@ -2413,8 +2545,320 @@ impl<'a> Emitter<'a> {
         }
         Ok(())
     }
-}
 
+    /// Stage one command issue: store `id = next * n + site` in the staging
+    /// area and bump both counters. The tail writer serializes it.
+    fn stage_cmd(site: usize, n_sites: usize, ins: &mut Vec<I<'static>>) {
+        ins.extend([
+            I::I32Const(CMD_STAGE),
+            I::GlobalGet(G_CMD_COUNT),
+            I::I32Const(4),
+            I::I32Mul,
+            I::I32Add,
+            I::GlobalGet(G_NEXT_ID),
+            I::I32Const(n_sites as i32),
+            I::I32Mul,
+            I::I32Const(site as i32),
+            I::I32Add,
+            I::I32Store(MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }),
+            I::GlobalGet(G_CMD_COUNT),
+            I::I32Const(1),
+            I::I32Add,
+            I::GlobalSet(G_CMD_COUNT),
+            I::GlobalGet(G_NEXT_ID),
+            I::I32Const(1),
+            I::I32Add,
+            I::GlobalSet(G_NEXT_ID),
+        ]);
+    }
+
+    /// fx_tail(): the cmds + subs tail of every message. Serializes staged
+    /// commands (spec chosen by `id % n_sites`), then diffs each sub site's
+    /// wanted-ness against the active bitmask into start/stop deltas.
+    fn fn_fx_tail(&mut self) -> Result<Function, String> {
+        let n = self.cmd_sites.len();
+        let mut ctx = Ctx::new(0);
+        let mut ins: Vec<I<'static>> = Vec::new();
+
+        // Commands.
+        if n == 0 {
+            Self::c_wvu(&mut ins, 0);
+        } else {
+            let i = ctx.tmp(ValType::I32);
+            let id = ctx.tmp(ValType::I32);
+            let c = ctx.tmp(ValType::I32);
+            ins.push(I::GlobalGet(G_CMD_COUNT));
+            ins.push(I::Call(F_WVU));
+            ins.push(I::I32Const(0));
+            ins.push(I::LocalSet(i));
+            ins.push(I::Block(BlockType::Empty));
+            ins.push(I::Loop(BlockType::Empty));
+            ins.push(I::LocalGet(i));
+            ins.push(I::GlobalGet(G_CMD_COUNT));
+            ins.push(I::I32GeU);
+            ins.push(I::BrIf(1));
+            ins.push(I::I32Const(CMD_STAGE));
+            ins.push(I::LocalGet(i));
+            ins.push(I::I32Const(4));
+            ins.push(I::I32Mul);
+            ins.push(I::I32Add);
+            ins.push(I::I32Load(MemArg {
+                offset: 0,
+                align: 2,
+                memory_index: 0,
+            }));
+            ins.push(I::LocalSet(id));
+            ins.push(I::LocalGet(id));
+            ins.push(I::Call(F_WVU));
+            ins.push(I::LocalGet(id));
+            ins.push(I::I32Const(n as i32));
+            ins.push(I::I32RemU);
+            ins.push(I::LocalSet(c));
+            let specs: Vec<(usize, Option<i64>, Option<String>)> = self
+                .cmd_sites
+                .iter()
+                .enumerate()
+                .map(|(i, cmd)| match cmd {
+                    CmdSite::Delay { ms, .. } => (i, Some(*ms), None),
+                    CmdSite::Http { url, .. } => (i, None, Some(url.clone())),
+                })
+                .collect();
+            for (site, delay_ms, http_url) in specs {
+                ins.push(I::LocalGet(c));
+                ins.push(I::I32Const(site as i32));
+                ins.push(I::I32Eq);
+                ins.push(I::If(BlockType::Empty));
+                if let Some(ms) = delay_ms {
+                    Self::c_w8(&mut ins, 0);
+                    Self::c_wvu(&mut ins, ms as u32);
+                }
+                if let Some(url) = http_url {
+                    Self::c_w8(&mut ins, 1);
+                    self.c_wstr(&mut ins, &url);
+                }
+                ins.push(I::End);
+            }
+            ins.push(I::LocalGet(i));
+            ins.push(I::I32Const(1));
+            ins.push(I::I32Add);
+            ins.push(I::LocalSet(i));
+            ins.push(I::Br(0));
+            ins.push(I::End);
+            ins.push(I::End);
+            ins.push(I::I32Const(0));
+            ins.push(I::GlobalSet(G_CMD_COUNT));
+        }
+
+        // Subscriptions: count pass, then emit pass with bitmask updates.
+        let sites: Vec<(i64, Vec<(Expr, bool)>)> = self
+            .sub_sites
+            .iter()
+            .map(|s| (s.ms, s.conds.clone()))
+            .collect();
+        if sites.is_empty() {
+            Self::c_wvu(&mut ins, 0);
+        } else {
+            let w = ctx.tmp(ValType::I32);
+            let a = ctx.tmp(ValType::I32);
+            let cnt = ctx.tmp(ValType::I32);
+            ins.push(I::I32Const(0));
+            ins.push(I::LocalSet(cnt));
+            for (site, (_, conds)) in sites.iter().enumerate() {
+                self.emit_wanted(conds, &mut ctx, &mut ins)?;
+                ins.push(I::LocalSet(w));
+                ins.push(I::GlobalGet(G_SUBS_ACTIVE));
+                ins.push(I::I32Const(site as i32));
+                ins.push(I::I32ShrU);
+                ins.push(I::I32Const(1));
+                ins.push(I::I32And);
+                ins.push(I::LocalSet(a));
+                ins.push(I::LocalGet(w));
+                ins.push(I::LocalGet(a));
+                ins.push(I::I32Ne);
+                ins.push(I::If(BlockType::Empty));
+                ins.push(I::LocalGet(cnt));
+                ins.push(I::I32Const(1));
+                ins.push(I::I32Add);
+                ins.push(I::LocalSet(cnt));
+                ins.push(I::End);
+            }
+            ins.push(I::LocalGet(cnt));
+            ins.push(I::Call(F_WVU));
+            for (site, (ms, conds)) in sites.iter().enumerate() {
+                self.emit_wanted(conds, &mut ctx, &mut ins)?;
+                ins.push(I::LocalSet(w));
+                ins.push(I::GlobalGet(G_SUBS_ACTIVE));
+                ins.push(I::I32Const(site as i32));
+                ins.push(I::I32ShrU);
+                ins.push(I::I32Const(1));
+                ins.push(I::I32And);
+                ins.push(I::LocalSet(a));
+                // start: wanted && !active
+                ins.push(I::LocalGet(w));
+                ins.push(I::LocalGet(a));
+                ins.push(I::I32Eqz);
+                ins.push(I::I32And);
+                ins.push(I::If(BlockType::Empty));
+                Self::c_w8(&mut ins, 0); // start
+                Self::c_wvu(&mut ins, site as u32); // id = site
+                Self::c_w8(&mut ins, 0); // every
+                Self::c_wvu(&mut ins, *ms as u32);
+                ins.push(I::GlobalGet(G_SUBS_ACTIVE));
+                ins.push(I::I32Const(1 << site));
+                ins.push(I::I32Or);
+                ins.push(I::GlobalSet(G_SUBS_ACTIVE));
+                ins.push(I::End);
+                // stop: !wanted && active
+                ins.push(I::LocalGet(w));
+                ins.push(I::I32Eqz);
+                ins.push(I::LocalGet(a));
+                ins.push(I::I32And);
+                ins.push(I::If(BlockType::Empty));
+                Self::c_w8(&mut ins, 1); // stop
+                Self::c_wvu(&mut ins, site as u32);
+                ins.push(I::GlobalGet(G_SUBS_ACTIVE));
+                ins.push(I::I32Const(!(1i32 << site)));
+                ins.push(I::I32And);
+                ins.push(I::GlobalSet(G_SUBS_ACTIVE));
+                ins.push(I::End);
+            }
+        }
+        ins.push(I::End);
+        Ok(ctx.into_function(&[], &ins))
+    }
+
+    /// AND together a sub site's path conditions (empty = always wanted).
+    fn emit_wanted(
+        &mut self,
+        conds: &[(Expr, bool)],
+        ctx: &mut Ctx,
+        ins: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        ins.push(I::I32Const(1));
+        for (cond, polarity) in conds {
+            self.bool_expr(cond, ctx, ins)?;
+            if !polarity {
+                ins.push(I::I32Eqz);
+            }
+            ins.push(I::I32And);
+        }
+        Ok(())
+    }
+
+    /// resolve(id, ok, status, payload_len): a command finished. The
+    /// callsite (`id % n`) picks the continuation; httpGet builds its String
+    /// payload (body, or "error <status>").
+    fn fn_resolve(&mut self) -> Result<Function, String> {
+        let n = self.cmd_sites.len();
+        let mut ctx = Ctx::new(4);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.push(I::I32Const(0));
+        ins.push(I::GlobalSet(G_CURSOR));
+        if n > 0 {
+            let c = ctx.tmp(ValType::I32);
+            ins.push(I::LocalGet(0));
+            ins.push(I::I32Const(n as i32));
+            ins.push(I::I32RemU);
+            ins.push(I::LocalSet(c));
+            let sites: Vec<(usize, bool, u32)> = self
+                .cmd_sites
+                .iter()
+                .enumerate()
+                .map(|(i, s)| match s {
+                    CmdSite::Delay { msg, .. } => (i, false, *msg),
+                    CmdSite::Http { ctor, .. } => (i, true, *ctor),
+                })
+                .collect();
+            for (site, is_http, msg) in sites {
+                ins.push(I::Block(BlockType::Empty));
+                ins.push(I::LocalGet(c));
+                ins.push(I::I32Const(site as i32));
+                ins.push(I::I32Ne);
+                ins.push(I::BrIf(0));
+                if is_http {
+                    ins.push(I::LocalGet(1)); // ok
+                    ins.push(I::If(BlockType::Empty));
+                    ins.push(I::I32Const(PAYLOAD_BUF));
+                    ins.push(I::LocalGet(3));
+                    ins.push(I::Call(F_MEM2STR));
+                    ins.push(I::GlobalSet(G_PAYLOAD));
+                    ins.push(I::Else);
+                    let (off, len) = self.pool.intern("error ");
+                    ins.push(I::I32Const(off));
+                    ins.push(I::I32Const(len));
+                    ins.push(I::ArrayNewData {
+                        array_type_index: T_STR,
+                        array_data_index: 1,
+                    });
+                    ins.push(I::LocalGet(2)); // status
+                    ins.push(I::I64ExtendI32S);
+                    ins.push(I::Call(F_ITOA));
+                    ins.push(I::Call(F_CONCAT_STR));
+                    ins.push(I::GlobalSet(G_PAYLOAD));
+                    ins.push(I::End);
+                }
+                ins.push(I::I32Const(msg as i32));
+                ins.push(I::Call(self.f_update()));
+                ins.push(I::Call(self.f_patches()));
+                ins.push(I::GlobalGet(G_CURSOR));
+                ins.push(I::Return);
+                ins.push(I::End);
+            }
+        }
+        // Unknown id (or no commands at all): a clean empty update.
+        Self::c_w8(&mut ins, WIRE_VERSION);
+        for _ in 0..4 {
+            Self::c_wvu(&mut ins, 0);
+        }
+        ins.push(I::GlobalGet(G_CURSOR));
+        ins.push(I::End);
+        Ok(ctx.into_function(&[], &ins))
+    }
+
+    /// notify(id, now): a subscription fired. Sub ids are site indices;
+    /// clocked sites pass the shim's clock through the i64 payload global.
+    fn fn_notify(&mut self) -> Result<Function, String> {
+        let ctx = Ctx::new(2);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.push(I::I32Const(0));
+        ins.push(I::GlobalSet(G_CURSOR));
+        let sites: Vec<(usize, bool, u32)> = self
+            .sub_sites
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (i, s.clocked, s.msg))
+            .collect();
+        for (site, clocked, msg) in sites {
+            ins.push(I::Block(BlockType::Empty));
+            ins.push(I::LocalGet(0));
+            ins.push(I::I32Const(site as i32));
+            ins.push(I::I32Ne);
+            ins.push(I::BrIf(0));
+            if clocked {
+                ins.push(I::LocalGet(1));
+                ins.push(I::I64TruncSatF64S);
+                ins.push(I::GlobalSet(G_PAYLOAD_I64));
+            }
+            ins.push(I::I32Const(msg as i32));
+            ins.push(I::Call(self.f_update()));
+            ins.push(I::Call(self.f_patches()));
+            ins.push(I::GlobalGet(G_CURSOR));
+            ins.push(I::Return);
+            ins.push(I::End);
+        }
+        Self::c_w8(&mut ins, WIRE_VERSION);
+        for _ in 0..4 {
+            Self::c_wvu(&mut ins, 0);
+        }
+        ins.push(I::GlobalGet(G_CURSOR));
+        ins.push(I::End);
+        Ok(ctx.into_function(&[], &ins))
+    }
+}
 /// Owned mirror of HandlerKind so dispatch can iterate without aliasing self.
 enum HandlerKindOwned {
     Static {
@@ -2507,19 +2951,24 @@ view = div [] []
     }
 
     #[test]
-    fn effects_error_cleanly() {
+    fn clock_with_effects_emits_a_valid_module() {
+        assert_valid(include_str!("../../../examples/lang-clock/clock.zu"));
+    }
+
+    #[test]
+    fn computed_http_urls_error_cleanly() {
         let src = r#"
 app E
-model { n: Int }
-init = { n = 0 }
-msg M | P
-update M = { n = 1 } then delay(100, P)
-update P = { n = 2 }
+model { u: String }
+init = { u = "" }
+msg M | Got String
+update M = { u = "" } then httpGet(model.u, Got)
+update Got s = { u = s }
 view = div [] []
 "#;
         let app = zumar_lang::compile(src).unwrap();
         let err = emit(&app).unwrap_err();
-        assert!(err.contains("effects"), "{err}");
+        assert!(err.contains("computed httpGet urls"), "{err}");
     }
 
     #[test]

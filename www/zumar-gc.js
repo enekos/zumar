@@ -10,7 +10,7 @@
 const EMPTY_UPDATE = Uint8Array.of(1, 0, 0, 0, 0); // ver, 0 patches/events/cmds/subs
 
 export function gcApp(exports) {
-  const { mem, init, dispatch, path_buf, payload_buf } = exports;
+  const { mem, init, dispatch, resolve, notify, path_buf, payload_buf } = exports;
   const utf8 = new TextEncoder();
   let eventNames = [];
 
@@ -37,12 +37,19 @@ export function gcApp(exports) {
       }
       return read(dispatch(idx, path.length, payloadLen));
     },
-    // The GC backend emits no commands or subscriptions yet.
-    resolve() {
-      return EMPTY_UPDATE;
+    resolve(id, ok, status, body) {
+      if (!resolve) return EMPTY_UPDATE;
+      let payloadLen = 0;
+      if (typeof body === "string") {
+        const bytes = utf8.encode(body);
+        new Uint8Array(mem.buffer, payload_buf.value, bytes.length).set(bytes);
+        payloadLen = bytes.length;
+      }
+      return read(resolve(id, ok ? 1 : 0, status | 0, payloadLen));
     },
-    notify() {
-      return EMPTY_UPDATE;
+    notify(id, now) {
+      if (!notify) return EMPTY_UPDATE;
+      return read(notify(id, typeof now === "number" ? now : 0));
     },
   };
 }

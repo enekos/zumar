@@ -126,8 +126,7 @@ includes `/` and `%`, with division by zero yielding 0, Elm's rule. See
 ### Not there yet
 
 No *user-defined* sum types or general pattern matching (only the built-in
-`Maybe`/`case`), and no `fold`/lambdas. The WasmGC backend doesn't take
-effects yet — apps using `then`/`sub` build on the default Rust backend.
+`Maybe`/`case`), and no `fold`/lambdas.
 
 ## The protocol
 
@@ -163,8 +162,11 @@ verbatim.
   (`Toggle(t.id)`) from the clicked item's path index at dispatch time. The
   full todo app is 3 KB (vs ~57 KB through the Rust backend); counter is
   1.7 KB. `www/zumar-gc.js` adapts the raw exports to the standard shim, so
-  GC modules run in normal browser pages. Not yet there: `Maybe`, Bool
-  payloads, nested `for`, effects.
+  GC modules run in normal browser pages. Effects work without a runtime
+  too: command ids encode their compile-time callsite, subscriptions keep a
+  wanted-vs-active bitmask emitting start/stop deltas — clock.zu with its
+  interval, fetches, and delay chain is 2.7 KB. Not yet there: `Maybe`,
+  Bool payloads, nested `for`.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
   and lang-counter / lang-todo / lang-expenses / lang-queue / lang-clock
   (compiled from `.zu`).
@@ -215,8 +217,8 @@ python3 -m http.server 8765 -d www
 7. ~~GC backend: strings, records, `for` regions, payloads — counter,
    hello, and todo all run on it~~
 8. ~~effects in the language: `then` commands, `sub` subscriptions, `/`
-   and `%` (`clock.zu`)~~
-9. next: user-defined sum types + general pattern matching; effects on the
-   GC backend; GC gaps (`Maybe`, Bool payloads, nested `for`).
+   and `%` (`clock.zu`)~~ + ~~effects on the GC backend~~
+9. next: user-defined sum types + general pattern matching; GC gaps
+   (`Maybe`, Bool payloads, nested `for`).
 
 MIT.

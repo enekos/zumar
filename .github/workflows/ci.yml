@@ -54,13 +54,14 @@ jobs:
           cd www && cp ../test.mjs . && node test.mjs
       - name: wasmgc backend (emit counter/hello/todo, run behavior harnesses)
         run: |
-          for app in counter hello todo; do
+          for app in counter hello todo clock; do
             cargo run --release -p zumar-wasmgc --bin zuc-gc -- \
               examples/lang-$app/$app.zu -o spikes/wasmgc/$app-emitted.wasm
           done
           node spikes/wasmgc/run-emitted.mjs
           node spikes/wasmgc/run-hello.mjs
           node spikes/wasmgc/run-todo.mjs
+          node spikes/wasmgc/run-clock.mjs
       - name: wire smoke test through the wasm binary
         run: |
           cd examples/effects/www

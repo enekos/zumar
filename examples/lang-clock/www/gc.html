@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>clock.zu — effects on the WasmGC backend</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: center;
+      background: #12140f; color: #e8e6d9;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    }
+    .clock { text-align: center; width: min(26rem, 90vw); }
+    .clock h1 { font-size: 1.8rem; letter-spacing: 0.2em; color: #d9c86a; margin-bottom: 0.1rem; }
+    .sub { color: #6f7362; font-size: 0.78rem; margin-top: 0; }
+    .sec { font-size: 3rem; font-variant-numeric: tabular-nums; margin: 1rem 0 0.6rem; color: #d9c86a; }
+    button {
+      background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; font-size: 0.85rem;
+      padding: 0.4rem 1rem; cursor: pointer;
+    }
+    button:hover { border-color: #d9c86a; }
+    blockquote { margin: 1rem 0; color: #c9c6b4; font-style: italic; font-size: 0.9rem; min-height: 1.4em; }
+    .row { display: flex; align-items: center; justify-content: center; gap: 0.8rem; }
+    .toast { color: #d9c86a; font-size: 0.85rem; min-height: 1em; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import { mount } from "./zumar.js";
+    import { gcApp } from "./zumar-gc.js";
+    const { instance } = await WebAssembly.instantiateStreaming(fetch("./pkg/clock-gc.wasm"), {});
+    mount(gcApp(instance.exports), document.getElementById("app"));
+  </script>
+</body>
+</html>
