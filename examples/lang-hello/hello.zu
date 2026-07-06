@@ -1,0 +1,28 @@
+# hello.zu — the first interactive-text app on the WasmGC backend.
+# Strings live on the GC heap; typing flows host -> payload buffer -> GC
+# string -> model struct, and the greeting re-renders via the compile-time
+# patch plan. Build: zuc-gc hello.zu -o www/pkg/hello.wasm
+# (also compiles with the default Rust backend: zuc dev hello.zu)
+
+app Hello
+
+model { name: String, taps: Int }
+
+init = { name = "", taps = 0 }
+
+msg Name String | Clear
+
+update Name s = { name = s }
+update Clear = { name = "", taps = model.taps + 1 }
+
+view =
+  div [class "hello"] [
+    h1 [] [ text "hello.zu" ],
+    p [class "sub"] [ text "GC-heap strings, straight from a .zu file" ],
+    input [type "text", placeholder "your name", value model.name, onInput Name] [],
+    p [class "greet"] [
+      text (if model.name == "" then "nor zara?" else "kaixo, " ++ model.name ++ "!")
+    ],
+    button [onClick Clear] [ text "clear" ],
+    p [class "count"] [ text (if model.taps > 0 then show(model.taps) ++ " clears" else "") ]
+  ]

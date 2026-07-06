@@ -19,7 +19,7 @@ const initMsg = decodeInit(read(init()));
 const eventIdx = (name) => initMsg.events.findIndex((e) => e.name === name);
 function fire(path, event = "click") {
   new Uint32Array(mem.buffer, path_buf.value, path.length).set(path);
-  return decodeUpdate(read(dispatch(eventIdx(event), path.length)));
+  return decodeUpdate(read(dispatch(eventIdx(event), path.length, 0)));
 }
 const textAt = (patches, path) =>
   patches.find((p) => p.op === "setText" && p.path.join(",") === path.join(","))?.text;

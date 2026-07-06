@@ -1,73 +1,99 @@
 #![forbid(unsafe_code)]
-//! WasmGC backend spike: emit a self-contained GC module from the zumar-lang
-//! AST via `wasm-encoder`. No Rust toolchain, no wasm-bindgen, no runtime
-//! crate — the module is the whole app.
+//! WasmGC backend: emit a self-contained GC module from the zumar-lang AST
+//! via `wasm-encoder`. No Rust toolchain, no wasm-bindgen, no runtime crate —
+//! the module is the whole app.
 //!
 //! The load-bearing idea: `.zu` views are statically known, so the compiler
 //! emits a **compile-time patch plan** instead of shipping a diff. Every
-//! dynamic text node's path is known at compile time; `dispatch` runs the
-//! update on a GC struct and re-serializes exactly those texts as SetText
-//! patches. No vdom in memory, no runtime.wasm — which retires the open
-//! question from the first spike.
+//! dynamic text node and attribute has a compile-time path; `dispatch` runs
+//! the update against the GC model struct and re-serializes exactly those as
+//! SetText/SetAttr patches. No vdom in memory, no diff at runtime.
 //!
-//! Boundary (raw exports, no glue):
+//! Strings live on the GC heap as `array (mut i8)`. String expressions are
+//! *values* (constants via `array.new_data` from a passive segment, payload
+//! via a staging buffer, `show` via an emitted itoa, `++` via an emitted
+//! concat), written to the wire by one serializer. Int model fields are i64
+//! struct fields.
+//!
+//! Boundary (raw exports, no glue; `www/zumar-gc.js` adapts this to the
+//! standard shim):
 //! - `init() -> len` — wire-encoded InitialRender at mem[0..len]
-//! - `dispatch(event_idx, path_len) -> len` — event_idx indexes the events
-//!   array of the init message; the host writes the path's u32s at
-//!   `path_buf` first.
-//! - `mem`, `path_buf` exports.
+//! - `dispatch(event_idx, path_len, payload_len) -> len` — event_idx indexes
+//!   the events array of the init message; the host writes the path's u32s
+//!   at `path_buf` and any String payload's UTF-8 at `payload_buf` first.
+//! - `mem`, `path_buf`, `payload_buf` exports.
 //!
-//! Handler resolution mirrors the runtime's bubbling: handlers are matched
-//! deepest-first by path prefix. Update messages mutate the model struct
-//! (GC heap); the wire buffer lives in linear memory.
-//!
-//! Subset (the counter shape): Int model fields, payload-less messages,
-//! static element tree, literal string attributes, text children that are
-//! string literals or Int-derived (`show`, `if`). Everything else reports a
-//! clear "not yet in the wasmgc backend" error — the Rust backend remains
-//! the default.
+//! Subset today: Int and String model fields, payload-less and
+//! String-payload messages, `onClick`/`onChange`/`onSubmit`/`onInput`,
+//! static element structure, dynamic text and attributes over Int/String
+//! expressions. Lists, records, `Maybe`, Bool payloads, and effects error
+//! with a pointer back to the default Rust backend.
 
 use std::collections::BTreeMap;
 
 use wasm_encoder::{
-    BlockType, CodeSection, ConstExpr, DataSection, ExportKind, ExportSection, FieldType, Function,
-    FunctionSection, GlobalSection, GlobalType, HeapType, Instruction as I, MemArg, MemorySection,
-    MemoryType, Module, RefType, StartSection, StorageType, TypeSection, ValType,
+    BlockType, CodeSection, ConstExpr, DataCountSection, DataSection, ExportKind, ExportSection,
+    FieldType, Function, FunctionSection, GlobalSection, GlobalType, HeapType, Instruction as I,
+    MemArg, MemorySection, MemoryType, Module, RefType, StartSection, StorageType, TypeSection,
+    ValType,
 };
-use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos};
+use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, ValueKind};
 
 const WIRE_VERSION: u8 = 1;
 
 // Memory layout: wire buffer grows from 0; itoa scratch; string constants
-// (active data segment); path staging written by the host.
+// (active data segment); payload and path staging written by the host.
 const SCRATCH: i32 = 3072;
 const DATA_BASE: i32 = 4096;
+const PAYLOAD_BUF: i32 = 56000;
 const PATH_BUF: i32 = 60000;
 
 // Type indices.
-const T_MODEL: u32 = 0;
-const T_I32: u32 = 1; // (i32) -> ()
-const T_II: u32 = 2; // (i32, i32) -> ()
-const T_I64: u32 = 3; // (i64) -> ()
+const T_STR: u32 = 0; // array (mut i8)
+const T_MODEL: u32 = 1;
+const T_I32: u32 = 2; // (i32) -> ()
+const T_II: u32 = 3; // (i32, i32) -> ()
 const T_VOID: u32 = 4; // () -> ()
 const T_RET: u32 = 5; // () -> i32
-const T_DISPATCH: u32 = 6; // (i32, i32) -> i32
+const T_DISPATCH: u32 = 6; // (i32, i32, i32) -> i32
+const T_ITOA: u32 = 7; // (i64) -> str
+const T_MEM2STR: u32 = 8; // (i32, i32) -> str
+const T_CONCAT: u32 = 9; // (str, str) -> str
+const T_STREQ: u32 = 10; // (str, str) -> i32
+const T_WSTRGC: u32 = 11; // (str) -> ()
 
 // Function indices (order of bodies below).
 const F_W8: u32 = 0;
 const F_WVU: u32 = 1;
 const F_WSTR: u32 = 2;
-const F_WITOA: u32 = 3;
-const F_UPDATE: u32 = 4;
-const F_PATCHES: u32 = 5;
-const F_BOOT: u32 = 6;
-const F_INIT: u32 = 7;
-const F_DISPATCH: u32 = 8;
+const F_ITOA: u32 = 3;
+const F_MEM2STR: u32 = 4;
+const F_CONCAT: u32 = 5;
+const F_STREQ: u32 = 6;
+const F_WSTRGC: u32 = 7;
+const F_UPDATE: u32 = 8;
+const F_PATCHES: u32 = 9;
+const F_BOOT: u32 = 10;
+const F_INIT: u32 = 11;
+const F_DISPATCH: u32 = 12;
 
 // Globals.
 const G_STATE: u32 = 0;
 const G_CURSOR: u32 = 1;
 const G_PATH_BUF: u32 = 2;
+const G_PAYLOAD_BUF: u32 = 3;
+const G_PAYLOAD: u32 = 4;
+
+fn str_ref() -> RefType {
+    RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(T_STR),
+    }
+}
+
+fn str_val() -> ValType {
+    ValType::Ref(str_ref())
+}
 
 pub fn emit(app: &App) -> Result<Vec<u8>, String> {
     Emitter::build(app)?.module()
@@ -86,13 +112,14 @@ struct Pool {
 }
 
 impl Pool {
+    /// Returns (segment-relative offset, len). Linear-memory address is
+    /// `DATA_BASE + offset`; `array.new_data` uses the offset directly.
     fn intern(&mut self, s: &str) -> (i32, i32) {
         if let Some(&hit) = self.map.get(s) {
             return hit;
         }
-        let off = DATA_BASE + self.bytes.len() as i32;
+        let entry = (self.bytes.len() as i32, s.len() as i32);
         self.bytes.extend_from_slice(s.as_bytes());
-        let entry = (off, s.len() as i32);
         self.map.insert(s.to_string(), entry);
         entry
     }
@@ -103,21 +130,31 @@ struct DynText {
     expr: Expr,
 }
 
+struct DynAttr {
+    path: Vec<u32>,
+    name: String,
+    expr: Expr,
+}
+
 struct Handler {
     path: Vec<u32>,
     event: String,
     msg: u32,
+    takes_payload: bool,
 }
 
 struct Emitter<'a> {
     app: &'a App,
-    fields: Vec<String>,
+    fields: Vec<(String, Ty)>,
     msgs: Vec<String>,
     pool: Pool,
     tree: Vec<I<'static>>,
-    dyns: Vec<DynText>,
+    dyn_texts: Vec<DynText>,
+    dyn_attrs: Vec<DynAttr>,
     handlers: Vec<Handler>,
     events: BTreeMap<String, bool>,
+    /// The bound payload variable while emitting an update arm.
+    payload_var: Option<String>,
 }
 
 impl<'a> Emitter<'a> {
@@ -126,27 +163,36 @@ impl<'a> Emitter<'a> {
             return Err(unsupported(r.pos, "record types"));
         }
         for (name, ty, pos) in &app.model {
-            if *ty != zumar_lang::ast::Ty::Int {
+            if !matches!(ty, Ty::Int | Ty::Str) {
                 return Err(unsupported(*pos, &format!("model field `{name}: {ty}`")));
             }
         }
         for m in &app.msgs {
-            if m.payload.is_some() {
-                return Err(unsupported(m.pos, "message payloads"));
+            match &m.payload {
+                None | Some(Ty::Str) => {}
+                Some(other) => {
+                    return Err(unsupported(m.pos, &format!("`{other}` message payloads")))
+                }
             }
         }
         let mut e = Emitter {
             app,
-            fields: app.model.iter().map(|(n, _, _)| n.clone()).collect(),
+            fields: app
+                .model
+                .iter()
+                .map(|(n, t, _)| (n.clone(), t.clone()))
+                .collect(),
             msgs: app.msgs.iter().map(|m| m.name.clone()).collect(),
             pool: Pool {
                 bytes: Vec::new(),
                 map: BTreeMap::new(),
             },
             tree: Vec::new(),
-            dyns: Vec::new(),
+            dyn_texts: Vec::new(),
+            dyn_attrs: Vec::new(),
             handlers: Vec::new(),
             events: BTreeMap::new(),
+            payload_var: None,
         };
         let mut tree = Vec::new();
         let mut path = Vec::new();
@@ -160,8 +206,16 @@ impl<'a> Emitter<'a> {
     fn field_index(&self, name: &str) -> u32 {
         self.fields
             .iter()
-            .position(|f| f == name)
+            .position(|(f, _)| f == name)
             .expect("typechecked") as u32
+    }
+
+    fn field_ty(&self, name: &str) -> Ty {
+        self.fields
+            .iter()
+            .find(|(f, _)| f == name)
+            .map(|(_, t)| t.clone())
+            .expect("typechecked")
     }
 
     fn msg_index(&self, name: &str) -> u32 {
@@ -171,11 +225,32 @@ impl<'a> Emitter<'a> {
             .expect("typechecked") as u32
     }
 
+    fn msg_takes_payload(&self, index: u32) -> bool {
+        self.app.msgs[index as usize].payload.is_some()
+    }
+
     fn event_code(&self, name: &str) -> i32 {
         self.events
             .keys()
             .position(|e| e == name)
             .expect("collected") as i32
+    }
+
+    /// Minimal type resolution for the supported subset (the checker has
+    /// already validated the program; this only steers codegen).
+    fn ty_of(&self, e: &Expr) -> Ty {
+        match e {
+            Expr::Int(_) | Expr::ToInt(..) | Expr::Len(..) | Expr::Sum(..) => Ty::Int,
+            Expr::Str(_) | Expr::Show(..) => Ty::Str,
+            Expr::Bool(_) | Expr::Not(..) => Ty::Bool,
+            Expr::Var(v, _) if self.payload_var.as_deref() == Some(v) => Ty::Str,
+            Expr::Field(_, f, _) => self.field_ty(f),
+            Expr::Bin(Op::Concat, ..) => Ty::Str,
+            Expr::Bin(Op::Add | Op::Sub | Op::Mul, ..) => Ty::Int,
+            Expr::Bin(..) => Ty::Bool,
+            Expr::If(_, t, ..) => self.ty_of(t),
+            _ => Ty::Int,
+        }
     }
 
     // --- write helpers (instruction sequences) ----------------------------
@@ -190,11 +265,25 @@ impl<'a> Emitter<'a> {
         out.push(I::Call(F_WVU));
     }
 
+    /// Write a pool string (varint length + bytes) from linear memory.
     fn c_wstr(&mut self, out: &mut Vec<I<'static>>, s: &str) {
         let (off, len) = self.pool.intern(s);
-        out.push(I::I32Const(off));
+        out.push(I::I32Const(DATA_BASE + off));
         out.push(I::I32Const(len));
         out.push(I::Call(F_WSTR));
+    }
+
+    /// Write a text expression: constants stream from the pool, dynamic
+    /// expressions build a GC string and serialize it.
+    fn c_text(&mut self, expr: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
+        if let Expr::Str(s) = expr {
+            let s = s.clone();
+            self.c_wstr(out, &s);
+            return Ok(());
+        }
+        self.str_expr(expr, out)?;
+        out.push(I::Call(F_WSTRGC));
+        Ok(())
     }
 
     // --- view walk ---------------------------------------------------------
@@ -216,10 +305,14 @@ impl<'a> Emitter<'a> {
                     if name == "key" {
                         return Err(unsupported(*pos, "keyed elements"));
                     }
-                    let Expr::Str(v) = value else {
-                        return Err(unsupported(*pos, "computed attribute values"));
-                    };
-                    str_attrs.push((name.clone(), v.clone()));
+                    if !matches!(value, Expr::Str(_)) {
+                        self.dyn_attrs.push(DynAttr {
+                            path: path.clone(),
+                            name: name.clone(),
+                            expr: value.clone(),
+                        });
+                    }
+                    str_attrs.push((name.clone(), value.clone()));
                 }
                 Attr::On {
                     event,
@@ -236,15 +329,33 @@ impl<'a> Emitter<'a> {
                         path: path.clone(),
                         event: event.clone(),
                         msg,
+                        takes_payload: false,
                     });
                 }
-                Attr::OnValue { pos, .. } => return Err(unsupported(*pos, "input events")),
+                Attr::OnValue {
+                    event,
+                    ctor,
+                    kind,
+                    pos,
+                } => {
+                    if *kind == ValueKind::Checked {
+                        return Err(unsupported(*pos, "`onCheck` (Bool payloads)"));
+                    }
+                    let msg = self.msg_index(ctor);
+                    self.events.entry(event.clone()).or_insert(false);
+                    self.handlers.push(Handler {
+                        path: path.clone(),
+                        event: event.clone(),
+                        msg,
+                        takes_payload: true,
+                    });
+                }
             }
         }
         Self::c_wvu(out, str_attrs.len() as u32);
         for (name, value) in str_attrs {
             self.c_wstr(out, &name);
-            self.c_wstr(out, &value);
+            self.c_text(&value, out)?;
         }
 
         Self::c_wvu(out, el.children.len() as u32);
@@ -255,13 +366,13 @@ impl<'a> Emitter<'a> {
                 Child::Text(expr, _) => {
                     Self::c_w8(out, 0); // text node
                     if !matches!(expr, Expr::Str(_)) {
-                        self.dyns.push(DynText {
+                        self.dyn_texts.push(DynText {
                             path: path.clone(),
                             expr: expr.clone(),
                         });
                     }
                     let expr = expr.clone();
-                    self.str_expr(&expr, out)?;
+                    self.c_text(&expr, out)?;
                 }
                 Child::For { pos, .. } => return Err(unsupported(*pos, "list rendering")),
             }
@@ -277,17 +388,7 @@ impl<'a> Emitter<'a> {
         match e {
             Expr::Int(n) => out.push(I::I64Const(*n)),
             Expr::Field(base, field, pos) => {
-                let Expr::Var(m, _) = base.as_ref() else {
-                    return Err(unsupported(*pos, "nested field access"));
-                };
-                if m != "model" {
-                    return Err(unsupported(*pos, "variables other than `model`"));
-                }
-                out.push(I::GlobalGet(G_STATE));
-                out.push(I::StructGet {
-                    struct_type_index: T_MODEL,
-                    field_index: self.field_index(field),
-                });
+                self.model_field(base, field, *pos, out)?;
             }
             Expr::Bin(op @ (Op::Add | Op::Sub | Op::Mul), l, r, _) => {
                 self.int_expr(l, out)?;
@@ -311,43 +412,40 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Push an i32 boolean onto the wasm stack.
-    fn bool_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
-        match e {
-            Expr::Bool(b) => out.push(I::I32Const(*b as i32)),
-            Expr::Not(inner, _) => {
-                self.bool_expr(inner, out)?;
-                out.push(I::I32Eqz);
-            }
-            Expr::Bin(op @ (Op::Eq | Op::Ne | Op::Lt | Op::Gt), l, r, _) => {
-                self.int_expr(l, out)?;
-                self.int_expr(r, out)?;
-                out.push(match op {
-                    Op::Eq => I::I64Eq,
-                    Op::Ne => I::I64Ne,
-                    Op::Lt => I::I64LtS,
-                    _ => I::I64GtS,
-                });
-            }
-            other => return Err(unsupported(pos_of(other), "this condition")),
-        }
-        Ok(())
-    }
-
-    /// Write a varint-length-prefixed string into the wire buffer.
+    /// Push a `(ref null $str)` onto the wasm stack.
     fn str_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
         match e {
             Expr::Str(s) => {
-                let s = s.clone();
-                self.c_wstr(out, &s);
+                let (off, len) = self.pool.intern(s);
+                out.push(I::I32Const(off));
+                out.push(I::I32Const(len));
+                out.push(I::ArrayNewData {
+                    array_type_index: T_STR,
+                    array_data_index: 1,
+                });
+            }
+            Expr::Var(v, pos) => {
+                if self.payload_var.as_deref() == Some(v) {
+                    out.push(I::GlobalGet(G_PAYLOAD));
+                } else {
+                    return Err(unsupported(*pos, &format!("variable `{v}`")));
+                }
+            }
+            Expr::Field(base, field, pos) => {
+                self.model_field(base, field, *pos, out)?;
             }
             Expr::Show(inner, _) => {
                 self.int_expr(inner, out)?;
-                out.push(I::Call(F_WITOA));
+                out.push(I::Call(F_ITOA));
+            }
+            Expr::Bin(Op::Concat, l, r, _) => {
+                self.str_expr(l, out)?;
+                self.str_expr(r, out)?;
+                out.push(I::Call(F_CONCAT));
             }
             Expr::If(c, t, f, _) => {
                 self.bool_expr(c, out)?;
-                out.push(I::If(BlockType::Empty));
+                out.push(I::If(BlockType::Result(str_val())));
                 self.str_expr(t, out)?;
                 out.push(I::Else);
                 self.str_expr(f, out)?;
@@ -358,42 +456,116 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// `model.<field>` -> struct.get (works for both i64 and str fields).
+    fn model_field(
+        &mut self,
+        base: &Expr,
+        field: &str,
+        pos: Pos,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let Expr::Var(m, _) = base else {
+            return Err(unsupported(pos, "nested field access"));
+        };
+        if m != "model" {
+            return Err(unsupported(pos, "variables other than `model`"));
+        }
+        out.push(I::GlobalGet(G_STATE));
+        out.push(I::StructGet {
+            struct_type_index: T_MODEL,
+            field_index: self.field_index(field),
+        });
+        Ok(())
+    }
+
+    /// Push an i32 boolean onto the wasm stack.
+    fn bool_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
+        match e {
+            Expr::Bool(b) => out.push(I::I32Const(*b as i32)),
+            Expr::Not(inner, _) => {
+                self.bool_expr(inner, out)?;
+                out.push(I::I32Eqz);
+            }
+            Expr::Bin(op @ (Op::Eq | Op::Ne), l, r, _) => {
+                if self.ty_of(l) == Ty::Str {
+                    self.str_expr(l, out)?;
+                    self.str_expr(r, out)?;
+                    out.push(I::Call(F_STREQ));
+                    if *op == Op::Ne {
+                        out.push(I::I32Eqz);
+                    }
+                } else {
+                    self.int_expr(l, out)?;
+                    self.int_expr(r, out)?;
+                    out.push(if *op == Op::Eq { I::I64Eq } else { I::I64Ne });
+                }
+            }
+            Expr::Bin(op @ (Op::Lt | Op::Gt), l, r, _) => {
+                self.int_expr(l, out)?;
+                self.int_expr(r, out)?;
+                out.push(if *op == Op::Lt { I::I64LtS } else { I::I64GtS });
+            }
+            other => return Err(unsupported(pos_of(other), "this condition")),
+        }
+        Ok(())
+    }
+
+    /// A model-field value by type (used by update arms and boot).
+    fn val_expr(&mut self, e: &Expr, ty: &Ty, out: &mut Vec<I<'static>>) -> Result<(), String> {
+        match ty {
+            Ty::Int => self.int_expr(e, out),
+            Ty::Str => self.str_expr(e, out),
+            _ => Err(unsupported(pos_of(e), "this field type")),
+        }
+    }
+
     // --- module assembly -----------------------------------------------------
 
     fn module(mut self) -> Result<Vec<u8>, String> {
         let mut module = Module::new();
 
-        // Types.
+        // Types. $str first so the model struct can reference it.
         let mut types = TypeSection::new();
+        types.ty().array(&StorageType::I8, true);
         types.ty().struct_(
             self.fields
                 .iter()
-                .map(|_| FieldType {
-                    element_type: StorageType::Val(ValType::I64),
+                .map(|(_, t)| FieldType {
+                    element_type: StorageType::Val(match t {
+                        Ty::Int => ValType::I64,
+                        _ => str_val(),
+                    }),
                     mutable: true,
                 })
                 .collect::<Vec<_>>(),
         );
         types.ty().function([ValType::I32], []);
         types.ty().function([ValType::I32, ValType::I32], []);
-        types.ty().function([ValType::I64], []);
         types.ty().function([], []);
         types.ty().function([], [ValType::I32]);
         types
             .ty()
-            .function([ValType::I32, ValType::I32], [ValType::I32]);
+            .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function([ValType::I64], [str_val()]);
+        types
+            .ty()
+            .function([ValType::I32, ValType::I32], [str_val()]);
+        types.ty().function([str_val(), str_val()], [str_val()]);
+        types.ty().function([str_val(), str_val()], [ValType::I32]);
+        types.ty().function([str_val()], []);
         module.section(&types);
 
         // Functions.
         let mut funcs = FunctionSection::new();
         for ty in [
-            T_I32, T_I32, T_II, T_I64, T_I32, T_VOID, T_VOID, T_RET, T_DISPATCH,
+            T_I32, T_I32, T_II, T_ITOA, T_MEM2STR, T_CONCAT, T_STREQ, T_WSTRGC, T_I32, T_VOID,
+            T_VOID, T_RET, T_DISPATCH,
         ] {
             funcs.function(ty);
         }
         module.section(&funcs);
 
-        // Memory: 2 pages (wire buffer + constants + path staging).
+        // Memory: 2 pages (wire buffer + constants + staging).
         let mut memory = MemorySection::new();
         memory.memory(MemoryType {
             minimum: 2,
@@ -404,15 +576,14 @@ impl<'a> Emitter<'a> {
         });
         module.section(&memory);
 
-        // Globals: model ref, wire cursor, path staging offset (exported).
-        let model_ref = RefType {
-            nullable: true,
-            heap_type: HeapType::Concrete(T_MODEL),
-        };
+        // Globals.
         let mut globals = GlobalSection::new();
         globals.global(
             GlobalType {
-                val_type: ValType::Ref(model_ref),
+                val_type: ValType::Ref(RefType {
+                    nullable: true,
+                    heap_type: HeapType::Concrete(T_MODEL),
+                }),
                 mutable: true,
                 shared: false,
             },
@@ -434,6 +605,22 @@ impl<'a> Emitter<'a> {
             },
             &ConstExpr::i32_const(PATH_BUF),
         );
+        globals.global(
+            GlobalType {
+                val_type: ValType::I32,
+                mutable: false,
+                shared: false,
+            },
+            &ConstExpr::i32_const(PAYLOAD_BUF),
+        );
+        globals.global(
+            GlobalType {
+                val_type: str_val(),
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::ref_null(HeapType::Concrete(T_STR)),
+        );
         module.section(&globals);
 
         // Exports.
@@ -442,11 +629,15 @@ impl<'a> Emitter<'a> {
         exports.export("init", ExportKind::Func, F_INIT);
         exports.export("dispatch", ExportKind::Func, F_DISPATCH);
         exports.export("path_buf", ExportKind::Global, G_PATH_BUF);
+        exports.export("payload_buf", ExportKind::Global, G_PAYLOAD_BUF);
         module.section(&exports);
 
         module.section(&StartSection {
             function_index: F_BOOT,
         });
+
+        // array.new_data requires a data-count section before code.
+        module.section(&DataCountSection { count: 2 });
 
         // Code — order must match the function section.
         let update = self.fn_update()?;
@@ -458,7 +649,11 @@ impl<'a> Emitter<'a> {
         code.function(&self.fn_w8());
         code.function(&self.fn_wvu());
         code.function(&self.fn_wstr());
-        code.function(&self.fn_witoa());
+        code.function(&self.fn_itoa());
+        code.function(&self.fn_mem2str());
+        code.function(&self.fn_concat());
+        code.function(&self.fn_streq());
+        code.function(&self.fn_wstrgc());
         code.function(&update);
         code.function(&patches);
         code.function(&boot);
@@ -466,13 +661,15 @@ impl<'a> Emitter<'a> {
         code.function(&dispatch);
         module.section(&code);
 
-        // Data: string constants.
+        // Data: segment 0 active (streamed by wstr via memory.copy),
+        // segment 1 passive (materialized by array.new_data). Same bytes.
         let mut data = DataSection::new();
         data.active(
             0,
             &ConstExpr::i32_const(DATA_BASE),
             self.pool.bytes.iter().copied(),
         );
+        data.passive(self.pool.bytes.iter().copied());
         module.section(&data);
 
         Ok(module.finish())
@@ -532,7 +729,7 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// wstr(off, len): varint length + bytes copied from the constant pool.
+    /// wstr(addr, len): varint length + bytes copied from linear memory.
     fn fn_wstr(&self) -> Function {
         let mut f = Function::new([]);
         for i in [
@@ -556,10 +753,11 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// witoa(n): varint-length-prefixed decimal of an i64.
-    /// (i64::MIN would render wrong through the negate; fine for a spike.)
-    fn fn_witoa(&self) -> Function {
-        let mut f = Function::new([(2, ValType::I32)]); // 1 = p, 2 = neg
+    /// itoa(n) -> str: decimal digits of an i64 as a fresh GC string.
+    /// (i64::MIN renders wrong through the negate; acceptable for now.)
+    fn fn_itoa(&self) -> Function {
+        // params: 0 = n (i64); locals: 1 = p, 2 = neg (i32), 3 = s, 4 = i
+        let mut f = Function::new([(2, ValType::I32), (1, str_val()), (1, ValType::I32)]);
         let mut ins: Vec<I<'static>> = Vec::new();
         // if n < 0 { neg = 1; n = 0 - n }
         ins.extend([
@@ -606,35 +804,224 @@ impl<'a> Emitter<'a> {
             I::BrIf(0),
             I::End,
         ]);
-        // length byte (< 128 always for i64), optional '-', reversed digits.
+        // s = new array(p + neg); s[0] = '-' when negative.
         ins.extend([
             I::LocalGet(1),
             I::LocalGet(2),
             I::I32Add,
-            I::Call(F_W8),
+            I::ArrayNewDefault(T_STR),
+            I::LocalSet(3),
             I::LocalGet(2),
             I::If(BlockType::Empty),
+            I::LocalGet(3),
+            I::I32Const(0),
             I::I32Const(45), // '-'
-            I::Call(F_W8),
+            I::ArraySet(T_STR),
             I::End,
+        ]);
+        // for i in 0..p: s[neg + i] = scratch[p - 1 - i]
+        ins.extend([
             I::Block(BlockType::Empty),
             I::Loop(BlockType::Empty),
+            I::LocalGet(4),
             I::LocalGet(1),
-            I::I32Eqz,
+            I::I32GeU,
             I::BrIf(1),
-            I::LocalGet(1),
-            I::I32Const(1),
-            I::I32Sub,
-            I::LocalSet(1),
+            I::LocalGet(3),
+            I::LocalGet(2),
+            I::LocalGet(4),
+            I::I32Add,
             I::I32Const(SCRATCH),
             I::LocalGet(1),
+            I::I32Add,
+            I::I32Const(1),
+            I::I32Sub,
+            I::LocalGet(4),
+            I::I32Sub,
+            I::I32Load8U(MemArg {
+                offset: 0,
+                align: 0,
+                memory_index: 0,
+            }),
+            I::ArraySet(T_STR),
+            I::LocalGet(4),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(4),
+            I::Br(0),
+            I::End,
+            I::End,
+            I::LocalGet(3),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    /// mem2str(addr, len) -> str: build a GC string from linear memory
+    /// (the payload staging buffer).
+    fn fn_mem2str(&self) -> Function {
+        // params: 0 = addr, 1 = len; locals: 2 = i, 3 = s
+        let mut f = Function::new([(1, ValType::I32), (1, str_val())]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(1),
+            I::ArrayNewDefault(T_STR),
+            I::LocalSet(3),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(2),
+            I::LocalGet(1),
+            I::I32GeU,
+            I::BrIf(1),
+            I::LocalGet(3),
+            I::LocalGet(2),
+            I::LocalGet(0),
+            I::LocalGet(2),
             I::I32Add,
             I::I32Load8U(MemArg {
                 offset: 0,
                 align: 0,
                 memory_index: 0,
             }),
+            I::ArraySet(T_STR),
+            I::LocalGet(2),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(2),
+            I::Br(0),
+            I::End,
+            I::End,
+            I::LocalGet(3),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    /// concat(a, b) -> str.
+    fn fn_concat(&self) -> Function {
+        // params: 0 = a, 1 = b; locals: 2 = la, 3 = lb, 4 = s
+        let mut f = Function::new([(2, ValType::I32), (1, str_val())]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(2),
+            I::LocalGet(1),
+            I::ArrayLen,
+            I::LocalSet(3),
+            I::LocalGet(2),
+            I::LocalGet(3),
+            I::I32Add,
+            I::ArrayNewDefault(T_STR),
+            I::LocalSet(4),
+            I::LocalGet(4),
+            I::I32Const(0),
+            I::LocalGet(0),
+            I::I32Const(0),
+            I::LocalGet(2),
+            I::ArrayCopy {
+                array_type_index_dst: T_STR,
+                array_type_index_src: T_STR,
+            },
+            I::LocalGet(4),
+            I::LocalGet(2),
+            I::LocalGet(1),
+            I::I32Const(0),
+            I::LocalGet(3),
+            I::ArrayCopy {
+                array_type_index_dst: T_STR,
+                array_type_index_src: T_STR,
+            },
+            I::LocalGet(4),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    /// streq(a, b) -> i32.
+    fn fn_streq(&self) -> Function {
+        // params: 0 = a, 1 = b; locals: 2 = i, 3 = la
+        let mut f = Function::new([(2, ValType::I32)]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(3),
+            I::LocalGet(3),
+            I::LocalGet(1),
+            I::ArrayLen,
+            I::I32Ne,
+            I::If(BlockType::Empty),
+            I::I32Const(0),
+            I::Return,
+            I::End,
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(2),
+            I::LocalGet(3),
+            I::I32GeU,
+            I::BrIf(1),
+            I::LocalGet(0),
+            I::LocalGet(2),
+            I::ArrayGetU(T_STR),
+            I::LocalGet(1),
+            I::LocalGet(2),
+            I::ArrayGetU(T_STR),
+            I::I32Ne,
+            I::If(BlockType::Empty),
+            I::I32Const(0),
+            I::Return,
+            I::End,
+            I::LocalGet(2),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(2),
+            I::Br(0),
+            I::End,
+            I::End,
+            I::I32Const(1),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    /// wstrgc(s): varint length + the GC string's bytes into the wire buffer.
+    fn fn_wstrgc(&self) -> Function {
+        // params: 0 = s; locals: 1 = i, 2 = l
+        let mut f = Function::new([(2, ValType::I32)]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(2),
+            I::LocalGet(2),
+            I::Call(F_WVU),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(1),
+            I::LocalGet(2),
+            I::I32GeU,
+            I::BrIf(1),
+            I::LocalGet(0),
+            I::LocalGet(1),
+            I::ArrayGetU(T_STR),
             I::Call(F_W8),
+            I::LocalGet(1),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(1),
             I::Br(0),
             I::End,
             I::End,
@@ -647,19 +1034,21 @@ impl<'a> Emitter<'a> {
     }
 
     /// update(msg): record-update semantics — new values computed against the
-    /// pre-update model into locals, then struct.set.
+    /// pre-update model into locals, then struct.set. A message with a String
+    /// payload reads it from the payload global (set by dispatch).
     fn fn_update(&mut self) -> Result<Function, String> {
-        let nfields = self.fields.len() as u32;
         let updates = self.app.updates.clone();
         let mut ins: Vec<I<'static>> = Vec::new();
         for u in &updates {
             let k = self.msg_index(&u.msg);
+            self.payload_var = u.var.as_ref().map(|(v, _)| v.clone());
             ins.push(I::LocalGet(0));
             ins.push(I::I32Const(k as i32));
             ins.push(I::I32Eq);
             ins.push(I::If(BlockType::Empty));
             for (field, expr, _) in &u.fields {
-                self.int_expr(expr, &mut ins)?;
+                let ty = self.field_ty(field);
+                self.val_expr(expr, &ty, &mut ins)?;
                 ins.push(I::LocalSet(1 + self.field_index(field)));
             }
             for (field, _, _) in &u.fields {
@@ -673,34 +1062,64 @@ impl<'a> Emitter<'a> {
             }
             ins.push(I::Return);
             ins.push(I::End);
+            self.payload_var = None;
         }
         ins.push(I::End);
-        let mut f = Function::new([(nfields, ValType::I64)]);
+        // One local per model field, typed to match.
+        let locals: Vec<(u32, ValType)> = self
+            .fields
+            .iter()
+            .map(|(_, t)| {
+                (
+                    1u32,
+                    if *t == Ty::Int {
+                        ValType::I64
+                    } else {
+                        str_val()
+                    },
+                )
+            })
+            .collect();
+        let mut f = Function::new(locals);
         for i in &ins {
             f.instruction(i);
         }
         Ok(f)
     }
 
-    /// patches(): the compile-time patch plan — one SetText per dynamic text,
-    /// unconditionally re-serialized. (Caching last values so unchanged texts
-    /// emit nothing is a later optimization; unconditional is protocol-correct.)
+    /// patches(): the compile-time patch plan — SetText for each dynamic
+    /// text, SetAttr for each dynamic attribute, unconditionally
+    /// re-serialized. (Caching last values is a later optimization.)
     fn fn_patches(&mut self) -> Result<Function, String> {
-        let dyns: Vec<(Vec<u32>, Expr)> = self
-            .dyns
+        let texts: Vec<(Vec<u32>, Expr)> = self
+            .dyn_texts
             .iter()
             .map(|d| (d.path.clone(), d.expr.clone()))
             .collect();
+        let attrs: Vec<(Vec<u32>, String, Expr)> = self
+            .dyn_attrs
+            .iter()
+            .map(|d| (d.path.clone(), d.name.clone(), d.expr.clone()))
+            .collect();
         let mut ins: Vec<I<'static>> = Vec::new();
         Self::c_w8(&mut ins, WIRE_VERSION);
-        Self::c_wvu(&mut ins, dyns.len() as u32);
-        for (path, expr) in &dyns {
+        Self::c_wvu(&mut ins, (texts.len() + attrs.len()) as u32);
+        for (path, expr) in &texts {
             Self::c_w8(&mut ins, 1); // setText
             Self::c_wvu(&mut ins, path.len() as u32);
             for seg in path {
                 Self::c_wvu(&mut ins, *seg);
             }
-            self.str_expr(expr, &mut ins)?;
+            self.c_text(expr, &mut ins)?;
+        }
+        for (path, name, expr) in &attrs {
+            Self::c_w8(&mut ins, 2); // setAttr
+            Self::c_wvu(&mut ins, path.len() as u32);
+            for seg in path {
+                Self::c_wvu(&mut ins, *seg);
+            }
+            self.c_wstr(&mut ins, name);
+            self.c_text(expr, &mut ins)?;
         }
         for _ in 0..3 {
             Self::c_wvu(&mut ins, 0); // events, cmds, subs
@@ -715,21 +1134,24 @@ impl<'a> Emitter<'a> {
 
     /// boot(): model = struct.new(init values). Runs via the start section.
     fn fn_boot(&mut self) -> Result<Function, String> {
-        let inits: Vec<Expr> = self
+        let inits: Vec<(Expr, Ty)> = self
             .fields
+            .clone()
             .iter()
-            .map(|name| {
-                self.app
+            .map(|(name, ty)| {
+                let expr = self
+                    .app
                     .init
                     .iter()
                     .find(|(n, _, _)| n == name)
                     .map(|(_, e, _)| e.clone())
-                    .expect("typechecked: init is total")
+                    .expect("typechecked: init is total");
+                (expr, ty.clone())
             })
             .collect();
         let mut ins: Vec<I<'static>> = Vec::new();
-        for expr in &inits {
-            self.int_expr(expr, &mut ins)?;
+        for (expr, ty) in &inits {
+            self.val_expr(expr, ty, &mut ins)?;
         }
         ins.push(I::StructNew(T_MODEL));
         ins.push(I::GlobalSet(G_STATE));
@@ -766,8 +1188,9 @@ impl<'a> Emitter<'a> {
         Ok(f)
     }
 
-    /// dispatch(event_idx, path_len): deepest-first prefix match over the
-    /// compile-time handler table (bubbling), then update + patch plan.
+    /// dispatch(event_idx, path_len, payload_len): deepest-first prefix match
+    /// over the compile-time handler table (bubbling); payload-taking
+    /// handlers materialize the staged bytes as a GC string first.
     fn fn_dispatch(&self) -> Function {
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.push(I::I32Const(0));
@@ -792,6 +1215,12 @@ impl<'a> Emitter<'a> {
                 ins.push(I::I32Const(*seg as i32));
                 ins.push(I::I32Ne);
                 ins.push(I::BrIf(0));
+            }
+            if h.takes_payload && self.msg_takes_payload(h.msg) {
+                ins.push(I::I32Const(PAYLOAD_BUF));
+                ins.push(I::LocalGet(2));
+                ins.push(I::Call(F_MEM2STR));
+                ins.push(I::GlobalSet(G_PAYLOAD));
             }
             ins.push(I::I32Const(h.msg as i32));
             ins.push(I::Call(F_UPDATE));
@@ -865,28 +1294,49 @@ view =
   ]
 "#;
 
-    fn emit_counter() -> Vec<u8> {
-        let app = zumar_lang::compile(COUNTER).unwrap();
-        emit(&app).unwrap()
+    const HELLO: &str = r#"
+app Hello
+model { name: String, taps: Int }
+init = { name = "", taps = 0 }
+msg Name String | Clear
+update Name s = { name = s }
+update Clear = { name = "", taps = model.taps + 1 }
+view =
+  div [] [
+    input [type "text", value model.name, onInput Name] [],
+    p [] [ text (if model.name == "" then "?" else "kaixo, " ++ model.name) ],
+    button [onClick Clear] [ text "clear" ]
+  ]
+"#;
+
+    fn emit_src(src: &str) -> Result<Vec<u8>, String> {
+        emit(&zumar_lang::compile(src).unwrap())
     }
 
     #[test]
     fn counter_emits_a_valid_gc_module() {
-        let bytes = emit_counter();
+        let bytes = emit_src(COUNTER).unwrap();
         wasmparser::Validator::new()
             .validate_all(&bytes)
             .unwrap_or_else(|e| panic!("emitted module is invalid: {e}"));
-        // Self-contained and small.
         assert!(
-            bytes.len() < 4096,
+            bytes.len() < 8192,
             "module unexpectedly large: {} bytes",
             bytes.len()
         );
     }
 
     #[test]
+    fn hello_with_gc_strings_emits_a_valid_module() {
+        let bytes = emit_src(HELLO).unwrap();
+        wasmparser::Validator::new()
+            .validate_all(&bytes)
+            .unwrap_or_else(|e| panic!("emitted module is invalid: {e}"));
+    }
+
+    #[test]
     fn unsupported_features_error_cleanly() {
-        let todoish = r#"
+        let src = r#"
 app T
 record Item { id: Int }
 model { n: Int }
@@ -895,9 +1345,24 @@ msg M
 update M = { n = 1 }
 view = div [] []
 "#;
-        let app = zumar_lang::compile(todoish).unwrap();
+        let app = zumar_lang::compile(src).unwrap();
         let err = emit(&app).unwrap_err();
         assert!(err.contains("record types"), "{err}");
+        assert!(err.contains("not yet in the wasmgc backend"), "{err}");
+    }
+
+    #[test]
+    fn bool_payloads_error_cleanly() {
+        let src = r#"
+app B
+model { on: Bool }
+init = { on = false }
+msg Flip Bool
+update Flip b = { on = b }
+view = div [] [ input [type "checkbox", onCheck Flip] [] ]
+"#;
+        let app = zumar_lang::compile(src).unwrap();
+        let err = emit(&app).unwrap_err();
         assert!(err.contains("not yet in the wasmgc backend"), "{err}");
     }
 }
