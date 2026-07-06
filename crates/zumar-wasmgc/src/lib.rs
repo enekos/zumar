@@ -3,31 +3,30 @@
 //! via `wasm-encoder`. No Rust toolchain, no wasm-bindgen, no runtime crate —
 //! the module is the whole app.
 //!
-//! The load-bearing idea: `.zu` views are statically known, so the compiler
-//! emits a **compile-time patch plan** instead of shipping a diff. Every
-//! dynamic text node and attribute has a compile-time path; `dispatch` runs
-//! the update against the GC model struct and re-serializes exactly those as
-//! SetText/SetAttr patches. No vdom in memory, no diff at runtime.
+//! Architecture: `.zu` views are statically known, so the compiler emits a
+//! **compile-time patch plan** instead of shipping a diff. Dynamic text and
+//! attributes have compile-time paths (SetText/SetAttr); a `for` over a list
+//! becomes a **region** — its parent element re-serializes wholesale into a
+//! Replace patch on each update. Event handlers inside a region are
+//! **parameterized**: the clicked item's index is read from the event path,
+//! the loop variable binds to `items[k]`, and the message argument (e.g.
+//! `Toggle(t.id)`) is evaluated at dispatch time. Still no vdom, no diff.
 //!
-//! Strings live on the GC heap as `array (mut i8)`. String expressions are
-//! *values* (constants via `array.new_data` from a passive segment, payload
-//! via a staging buffer, `show` via an emitted itoa, `++` via an emitted
-//! concat), written to the wire by one serializer. Int model fields are i64
-//! struct fields.
+//! Data lives on the GC heap: records are structs (Int → i64, Bool → i32,
+//! String → `array (mut i8)`), lists of records are `array (mut (ref null
+//! $Rec))`. Comprehensions lower to count+fill loops; `++`/`reverse` get
+//! per-type emitted helpers; `length(for … where c yield …)` compiles to
+//! just the counting loop.
 //!
-//! Boundary (raw exports, no glue; `www/zumar-gc.js` adapts this to the
-//! standard shim):
+//! Boundary (raw exports, no glue; `www/zumar-gc.js` adapts to the shim):
 //! - `init() -> len` — wire-encoded InitialRender at mem[0..len]
-//! - `dispatch(event_idx, path_len, payload_len) -> len` — event_idx indexes
-//!   the events array of the init message; the host writes the path's u32s
-//!   at `path_buf` and any String payload's UTF-8 at `payload_buf` first.
+//! - `dispatch(event_idx, path_len, payload_len) -> len`
 //! - `mem`, `path_buf`, `payload_buf` exports.
 //!
-//! Subset today: Int and String model fields, payload-less and
-//! String-payload messages, `onClick`/`onChange`/`onSubmit`/`onInput`,
-//! static element structure, dynamic text and attributes over Int/String
-//! expressions. Lists, records, `Maybe`, Bool payloads, and effects error
-//! with a pointer back to the default Rust backend.
+//! Not yet here (errors point back to the default Rust backend): `Maybe`,
+//! Bool payloads, nested `for`, comprehensions over non-record lists,
+//! effects. `key` attributes are accepted and ignored — regions replace
+//! wholesale, so keys have nothing to key.
 
 use std::collections::BTreeMap;
 
@@ -37,7 +36,7 @@ use wasm_encoder::{
     MemArg, MemorySection, MemoryType, Module, RefType, StartSection, StorageType, TypeSection,
     ValType,
 };
-use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, ValueKind};
+use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, ValueKind, MODEL};
 
 const WIRE_VERSION: u8 = 1;
 
@@ -48,34 +47,16 @@ const DATA_BASE: i32 = 4096;
 const PAYLOAD_BUF: i32 = 56000;
 const PATH_BUF: i32 = 60000;
 
-// Type indices.
-const T_STR: u32 = 0; // array (mut i8)
-const T_MODEL: u32 = 1;
-const T_I32: u32 = 2; // (i32) -> ()
-const T_II: u32 = 3; // (i32, i32) -> ()
-const T_VOID: u32 = 4; // () -> ()
-const T_RET: u32 = 5; // () -> i32
-const T_DISPATCH: u32 = 6; // (i32, i32, i32) -> i32
-const T_ITOA: u32 = 7; // (i64) -> str
-const T_MEM2STR: u32 = 8; // (i32, i32) -> str
-const T_CONCAT: u32 = 9; // (str, str) -> str
-const T_STREQ: u32 = 10; // (str, str) -> i32
-const T_WSTRGC: u32 = 11; // (str) -> ()
-
-// Function indices (order of bodies below).
+// Fixed function indices (the emitted stdlib comes first).
 const F_W8: u32 = 0;
 const F_WVU: u32 = 1;
 const F_WSTR: u32 = 2;
 const F_ITOA: u32 = 3;
 const F_MEM2STR: u32 = 4;
-const F_CONCAT: u32 = 5;
+const F_CONCAT_STR: u32 = 5;
 const F_STREQ: u32 = 6;
 const F_WSTRGC: u32 = 7;
-const F_UPDATE: u32 = 8;
-const F_PATCHES: u32 = 9;
-const F_BOOT: u32 = 10;
-const F_INIT: u32 = 11;
-const F_DISPATCH: u32 = 12;
+const F_FIXED: u32 = 8;
 
 // Globals.
 const G_STATE: u32 = 0;
@@ -83,17 +64,10 @@ const G_CURSOR: u32 = 1;
 const G_PATH_BUF: u32 = 2;
 const G_PAYLOAD_BUF: u32 = 3;
 const G_PAYLOAD: u32 = 4;
+const G_PAYLOAD_I64: u32 = 5;
 
-fn str_ref() -> RefType {
-    RefType {
-        nullable: true,
-        heap_type: HeapType::Concrete(T_STR),
-    }
-}
-
-fn str_val() -> ValType {
-    ValType::Ref(str_ref())
-}
+// Type index for $str is always first.
+const T_STR: u32 = 0;
 
 pub fn emit(app: &App) -> Result<Vec<u8>, String> {
     Emitter::build(app)?.module()
@@ -104,6 +78,17 @@ fn unsupported(pos: Pos, what: &str) -> String {
         "{}:{}: {what} is not yet in the wasmgc backend (use the default Rust backend)",
         pos.line, pos.col
     )
+}
+
+fn nullable(idx: u32) -> RefType {
+    RefType {
+        nullable: true,
+        heap_type: HeapType::Concrete(idx),
+    }
+}
+
+fn str_val() -> ValType {
+    ValType::Ref(nullable(T_STR))
 }
 
 struct Pool {
@@ -125,6 +110,86 @@ impl Pool {
     }
 }
 
+/// Where a name in scope lives during codegen.
+#[derive(Clone)]
+enum Slot {
+    PayloadStr,
+    PayloadInt,
+    /// A loop variable: local index + its record's name.
+    Item(u32, String),
+}
+
+/// Per-function codegen context: scope + temp-local allocation.
+struct Ctx {
+    env: Vec<(String, Slot)>,
+    locals: Vec<ValType>,
+    base: u32,
+}
+
+impl Ctx {
+    fn new(base: u32) -> Ctx {
+        Ctx {
+            env: Vec::new(),
+            locals: Vec::new(),
+            base,
+        }
+    }
+
+    fn tmp(&mut self, t: ValType) -> u32 {
+        self.locals.push(t);
+        self.base + self.locals.len() as u32 - 1
+    }
+
+    fn lookup(&self, name: &str) -> Option<Slot> {
+        self.env
+            .iter()
+            .rev()
+            .find(|(n, _)| n == name)
+            .map(|(_, s)| s.clone())
+    }
+
+    fn into_function(self, fixed: &[ValType], ins: &[I<'static>]) -> Function {
+        let mut locals: Vec<(u32, ValType)> = fixed.iter().map(|t| (1, *t)).collect();
+        locals.extend(self.locals.iter().map(|t| (1u32, *t)));
+        let mut f = Function::new(locals);
+        for i in ins {
+            f.instruction(i);
+        }
+        f
+    }
+}
+
+enum HandlerKind {
+    /// Fixed path; String payload comes from the event when `takes_input`.
+    Static {
+        takes_input: bool,
+        arg: Option<Expr>,
+    },
+    /// Inside a `for` region: prefix + item-index wildcard + suffix.
+    ForItem {
+        region: usize,
+        suffix: Vec<u32>,
+        arg: Option<Expr>,
+        takes_input: bool,
+    },
+}
+
+struct Handler {
+    prefix: Vec<u32>,
+    event: String,
+    msg: u32,
+    kind: HandlerKind,
+}
+
+impl Handler {
+    fn specificity(&self) -> usize {
+        match &self.kind {
+            HandlerKind::Static { .. } => self.prefix.len(),
+            HandlerKind::ForItem { suffix, .. } => self.prefix.len() + 1 + suffix.len(),
+        }
+    }
+}
+
 struct DynText {
     path: Vec<u32>,
     expr: Expr,
@@ -136,40 +201,60 @@ struct DynAttr {
     expr: Expr,
 }
 
-struct Handler {
+/// A `for` region: an element whose children are generated from a list.
+struct Region {
     path: Vec<u32>,
-    event: String,
-    msg: u32,
-    takes_payload: bool,
+    parent_tag: String,
+    parent_attrs: Vec<(String, Expr)>,
+    var: String,
+    list: Expr,
+    record: String,
+    body: Element,
 }
 
 struct Emitter<'a> {
     app: &'a App,
+    records: Vec<(String, Vec<(String, Ty)>)>,
     fields: Vec<(String, Ty)>,
     msgs: Vec<String>,
     pool: Pool,
     tree: Vec<I<'static>>,
     dyn_texts: Vec<DynText>,
     dyn_attrs: Vec<DynAttr>,
+    regions: Vec<Region>,
     handlers: Vec<Handler>,
     events: BTreeMap<String, bool>,
-    /// The bound payload variable while emitting an update arm.
-    payload_var: Option<String>,
+    /// Temp locals allocated while emitting the init tree.
+    init_ctx_locals: Vec<ValType>,
 }
 
 impl<'a> Emitter<'a> {
     fn build(app: &'a App) -> Result<Emitter<'a>, String> {
-        if let Some(r) = app.records.first() {
-            return Err(unsupported(r.pos, "record types"));
+        let mut records = Vec::new();
+        for r in &app.records {
+            for (name, ty, pos) in &r.fields {
+                if !matches!(ty, Ty::Int | Ty::Str | Ty::Bool) {
+                    return Err(unsupported(*pos, &format!("record field `{name}: {ty}`")));
+                }
+            }
+            records.push((
+                r.name.clone(),
+                r.fields
+                    .iter()
+                    .map(|(n, t, _)| (n.clone(), t.clone()))
+                    .collect(),
+            ));
         }
         for (name, ty, pos) in &app.model {
-            if !matches!(ty, Ty::Int | Ty::Str) {
-                return Err(unsupported(*pos, &format!("model field `{name}: {ty}`")));
+            match ty {
+                Ty::Int | Ty::Str => {}
+                Ty::List(inner) if matches!(inner.as_ref(), Ty::Record(_)) => {}
+                _ => return Err(unsupported(*pos, &format!("model field `{name}: {ty}`"))),
             }
         }
         for m in &app.msgs {
             match &m.payload {
-                None | Some(Ty::Str) => {}
+                None | Some(Ty::Str) | Some(Ty::Int) => {}
                 Some(other) => {
                     return Err(unsupported(m.pos, &format!("`{other}` message payloads")))
                 }
@@ -177,6 +262,7 @@ impl<'a> Emitter<'a> {
         }
         let mut e = Emitter {
             app,
+            records,
             fields: app
                 .model
                 .iter()
@@ -190,17 +276,116 @@ impl<'a> Emitter<'a> {
             tree: Vec::new(),
             dyn_texts: Vec::new(),
             dyn_attrs: Vec::new(),
+            regions: Vec::new(),
             handlers: Vec::new(),
             events: BTreeMap::new(),
-            payload_var: None,
+            init_ctx_locals: Vec::new(),
         };
+        // The init tree needs a Ctx for inline dynamic expressions.
+        let mut ctx = Ctx::new(0);
         let mut tree = Vec::new();
         let mut path = Vec::new();
-        e.walk(&app.view, &mut path, &mut tree)?;
+        e.walk(&app.view, &mut path, &mut ctx, &mut tree)?;
         e.tree = tree;
+        e.init_ctx_locals = ctx.locals.clone();
         // Deepest-first so bubbling picks the innermost handler.
-        e.handlers.sort_by_key(|h| std::cmp::Reverse(h.path.len()));
+        e.handlers
+            .sort_by_key(|h| std::cmp::Reverse(h.specificity()));
         Ok(e)
+    }
+
+    // --- type & function index layout ---------------------------------------
+
+    fn n_records(&self) -> u32 {
+        self.records.len() as u32
+    }
+
+    fn rec_idx(&self, name: &str) -> u32 {
+        1 + self
+            .records
+            .iter()
+            .position(|(n, _)| n == name)
+            .expect("typechecked") as u32
+    }
+
+    fn arr_idx(&self, name: &str) -> u32 {
+        1 + self.n_records()
+            + self
+                .records
+                .iter()
+                .position(|(n, _)| n == name)
+                .expect("typechecked") as u32
+    }
+
+    fn model_idx(&self) -> u32 {
+        1 + 2 * self.n_records()
+    }
+
+    fn ft(&self, k: u32) -> u32 {
+        2 + 2 * self.n_records() + k
+    }
+
+    // Function-type slots (after the data types).
+    fn t_i32(&self) -> u32 {
+        self.ft(0)
+    }
+    fn t_ii(&self) -> u32 {
+        self.ft(1)
+    }
+    fn t_void(&self) -> u32 {
+        self.ft(2)
+    }
+    fn t_ret(&self) -> u32 {
+        self.ft(3)
+    }
+    fn t_dispatch(&self) -> u32 {
+        self.ft(4)
+    }
+    fn t_itoa(&self) -> u32 {
+        self.ft(5)
+    }
+    fn t_mem2str(&self) -> u32 {
+        self.ft(6)
+    }
+    fn t_concat_str(&self) -> u32 {
+        self.ft(7)
+    }
+    fn t_streq(&self) -> u32 {
+        self.ft(8)
+    }
+    fn t_wstrgc(&self) -> u32 {
+        self.ft(9)
+    }
+    fn t_arrcat(&self, rec: usize) -> u32 {
+        self.ft(10 + 2 * rec as u32)
+    }
+    fn t_arrrev(&self, rec: usize) -> u32 {
+        self.ft(10 + 2 * rec as u32 + 1)
+    }
+
+    fn f_arrcat(&self, name: &str) -> u32 {
+        F_FIXED + 2 * self.records.iter().position(|(n, _)| n == name).unwrap() as u32
+    }
+    fn f_arrrev(&self, name: &str) -> u32 {
+        self.f_arrcat(name) + 1
+    }
+    fn f_region(&self, j: usize) -> u32 {
+        F_FIXED + 2 * self.n_records() + j as u32
+    }
+    fn f_update(&self) -> u32 {
+        self.f_region(self.regions.len())
+    }
+    fn f_patches(&self) -> u32 {
+        self.f_update() + 1
+    }
+    fn f_boot(&self) -> u32 {
+        self.f_update() + 2
+    }
+    fn f_init(&self) -> u32 {
+        self.f_update() + 3
+    }
+    fn f_dispatch(&self) -> u32 {
+        self.f_update() + 4
     }
 
     fn field_index(&self, name: &str) -> u32 {
@@ -218,6 +403,30 @@ impl<'a> Emitter<'a> {
             .expect("typechecked")
     }
 
+    fn record_fields(&self, name: &str) -> &[(String, Ty)] {
+        &self
+            .records
+            .iter()
+            .find(|(n, _)| n == name)
+            .expect("typechecked")
+            .1
+    }
+
+    fn record_field_index(&self, rec: &str, field: &str) -> u32 {
+        self.record_fields(rec)
+            .iter()
+            .position(|(f, _)| f == field)
+            .expect("typechecked") as u32
+    }
+
+    fn record_field_ty(&self, rec: &str, field: &str) -> Ty {
+        self.record_fields(rec)
+            .iter()
+            .find(|(f, _)| f == field)
+            .map(|(_, t)| t.clone())
+            .expect("typechecked")
+    }
+
     fn msg_index(&self, name: &str) -> u32 {
         self.msgs
             .iter()
@@ -225,8 +434,8 @@ impl<'a> Emitter<'a> {
             .expect("typechecked") as u32
     }
 
-    fn msg_takes_payload(&self, index: u32) -> bool {
-        self.app.msgs[index as usize].payload.is_some()
+    fn msg_payload(&self, index: u32) -> Option<Ty> {
+        self.app.msgs[index as usize].payload.clone()
     }
 
     fn event_code(&self, name: &str) -> i32 {
@@ -236,24 +445,82 @@ impl<'a> Emitter<'a> {
             .expect("collected") as i32
     }
 
-    /// Minimal type resolution for the supported subset (the checker has
-    /// already validated the program; this only steers codegen).
-    fn ty_of(&self, e: &Expr) -> Ty {
+    fn val_type(&self, ty: &Ty) -> ValType {
+        match ty {
+            Ty::Int => ValType::I64,
+            Ty::Bool => ValType::I32,
+            Ty::Str => str_val(),
+            Ty::Record(r) => ValType::Ref(nullable(self.rec_idx(r))),
+            Ty::List(inner) => {
+                let Ty::Record(r) = inner.as_ref() else {
+                    unreachable!("gated: record lists only")
+                };
+                ValType::Ref(nullable(self.arr_idx(r)))
+            }
+            Ty::Maybe(_) => unreachable!("gated"),
+        }
+    }
+
+    /// Type resolution for the supported subset (checker-validated programs;
+    /// this only steers codegen).
+    fn ty_of(&self, e: &Expr, ctx: &Ctx) -> Ty {
         match e {
             Expr::Int(_) | Expr::ToInt(..) | Expr::Len(..) | Expr::Sum(..) => Ty::Int,
             Expr::Str(_) | Expr::Show(..) => Ty::Str,
             Expr::Bool(_) | Expr::Not(..) => Ty::Bool,
-            Expr::Var(v, _) if self.payload_var.as_deref() == Some(v) => Ty::Str,
-            Expr::Field(_, f, _) => self.field_ty(f),
-            Expr::Bin(Op::Concat, ..) => Ty::Str,
+            Expr::Var(v, _) if v == "model" => Ty::Record(MODEL.into()),
+            Expr::Var(v, _) => match ctx.lookup(v) {
+                Some(Slot::PayloadStr) => Ty::Str,
+                Some(Slot::PayloadInt) => Ty::Int,
+                Some(Slot::Item(_, r)) => Ty::Record(r),
+                None => Ty::Int,
+            },
+            Expr::Field(base, f, _) => match self.ty_of(base, ctx) {
+                Ty::Record(r) if r == MODEL => self.field_ty(f),
+                Ty::Record(r) => self.record_field_ty(&r, f),
+                _ => Ty::Int,
+            },
+            Expr::Bin(Op::Concat, l, ..) => self.ty_of(l, ctx),
             Expr::Bin(Op::Add | Op::Sub | Op::Mul, ..) => Ty::Int,
             Expr::Bin(..) => Ty::Bool,
-            Expr::If(_, t, ..) => self.ty_of(t),
+            Expr::If(_, t, ..) => self.ty_of(t, ctx),
+            Expr::Reverse(inner, _) => self.ty_of(inner, ctx),
+            Expr::For {
+                var, list, body, ..
+            } => {
+                let Ty::List(elem) = self.ty_of(list, ctx) else {
+                    return Ty::Int;
+                };
+                let mut inner = Ctx::new(0);
+                inner.env = ctx.env.clone();
+                if let Ty::Record(r) = elem.as_ref() {
+                    inner.env.push((var.clone(), Slot::Item(0, r.clone())));
+                }
+                Ty::List(Box::new(self.ty_of(body, &inner)))
+            }
+            Expr::ListLit(items, _) => match items.first() {
+                Some(first) => Ty::List(Box::new(self.ty_of(first, ctx))),
+                None => Ty::List(Box::new(Ty::Int)),
+            },
+            Expr::RecordLit(fields, _) => {
+                let got: Vec<&str> = fields.iter().map(|(n, _, _)| n.as_str()).collect();
+                let name = self
+                    .records
+                    .iter()
+                    .find(|(_, defs)| {
+                        defs.len() == got.len()
+                            && defs.iter().all(|(n, _)| got.contains(&n.as_str()))
+                    })
+                    .map(|(n, _)| n.clone())
+                    .unwrap_or_default();
+                Ty::Record(name)
+            }
+            Expr::RecordUpdate(base, ..) => self.ty_of(base, ctx),
             _ => Ty::Int,
         }
     }
 
-    // --- write helpers (instruction sequences) ----------------------------
+    // --- write helpers ------------------------------------------------------
 
     fn c_w8(out: &mut Vec<I<'static>>, byte: u8) {
         out.push(I::I32Const(byte as i32));
@@ -265,7 +532,6 @@ impl<'a> Emitter<'a> {
         out.push(I::Call(F_WVU));
     }
 
-    /// Write a pool string (varint length + bytes) from linear memory.
     fn c_wstr(&mut self, out: &mut Vec<I<'static>>, s: &str) {
         let (off, len) = self.pool.intern(s);
         out.push(I::I32Const(DATA_BASE + off));
@@ -275,61 +541,159 @@ impl<'a> Emitter<'a> {
 
     /// Write a text expression: constants stream from the pool, dynamic
     /// expressions build a GC string and serialize it.
-    fn c_text(&mut self, expr: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
+    fn c_text(
+        &mut self,
+        expr: &Expr,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
         if let Expr::Str(s) = expr {
             let s = s.clone();
             self.c_wstr(out, &s);
             return Ok(());
         }
-        self.str_expr(expr, out)?;
+        self.str_expr(expr, ctx, out)?;
         out.push(I::Call(F_WSTRGC));
         Ok(())
     }
 
-    // --- view walk ---------------------------------------------------------
+    // --- view walk (static part) ---------------------------------------------
 
     fn walk(
         &mut self,
         el: &Element,
         path: &mut Vec<u32>,
+        ctx: &mut Ctx,
         out: &mut Vec<I<'static>>,
     ) -> Result<(), String> {
+        // An element whose children come from a `for` becomes a region.
+        let fors = el
+            .children
+            .iter()
+            .filter(|c| matches!(c, Child::For { .. }))
+            .count();
+        if fors > 0 {
+            if el.children.len() != 1 {
+                let Child::For { pos, .. } = el
+                    .children
+                    .iter()
+                    .find(|c| matches!(c, Child::For { .. }))
+                    .unwrap()
+                else {
+                    unreachable!()
+                };
+                return Err(unsupported(
+                    *pos,
+                    "`for` next to sibling children (make the `for` the element's only child)",
+                ));
+            }
+            let Child::For {
+                var,
+                list,
+                body,
+                pos,
+            } = &el.children[0]
+            else {
+                unreachable!()
+            };
+            let Ty::List(elem) = self.ty_of(list, ctx) else {
+                return Err(unsupported(*pos, "this list source"));
+            };
+            let Ty::Record(record) = elem.as_ref() else {
+                return Err(unsupported(*pos, "rendering a non-record list"));
+            };
+            let j = self.regions.len();
+            let parent_attrs = self.plain_attrs(el, path)?;
+            self.regions.push(Region {
+                path: path.clone(),
+                parent_tag: el.tag.clone(),
+                parent_attrs,
+                var: var.clone(),
+                list: list.clone(),
+                record: record.clone(),
+                body: (**body).clone(),
+            });
+            // Handlers inside the body are collected now, with suffix paths.
+            let body = (**body).clone();
+            let var = var.clone();
+            let record = record.clone();
+            let mut suffix = Vec::new();
+            self.collect_body_handlers(&body, path, &mut suffix, j, &var, &record)?;
+            out.push(I::Call(self.f_region(j)));
+            return Ok(());
+        }
+
         Self::c_w8(out, 1); // element
         let tag = el.tag.clone();
         self.c_wstr(out, &tag);
 
-        let mut str_attrs = Vec::new();
-        for attr in &el.attrs {
-            match attr {
-                Attr::Str { name, value, pos } => {
-                    if name == "key" {
-                        return Err(unsupported(*pos, "keyed elements"));
-                    }
-                    if !matches!(value, Expr::Str(_)) {
-                        self.dyn_attrs.push(DynAttr {
+        let attrs = self.plain_attrs(el, path)?;
+        Self::c_wvu(out, attrs.len() as u32);
+        for (name, value) in &attrs {
+            let name = name.clone();
+            let value = value.clone();
+            self.c_wstr(out, &name);
+            if !matches!(value, Expr::Str(_)) {
+                self.dyn_attrs.push(DynAttr {
+                    path: path.clone(),
+                    name,
+                    expr: value.clone(),
+                });
+            }
+            self.c_text(&value, ctx, out)?;
+        }
+
+        Self::c_wvu(out, el.children.len() as u32);
+        for (i, child) in el.children.iter().enumerate() {
+            path.push(i as u32);
+            match child {
+                Child::Elem(e) => self.walk(e, path, ctx, out)?,
+                Child::Text(expr, _) => {
+                    Self::c_w8(out, 0); // text node
+                    if !matches!(expr, Expr::Str(_)) {
+                        self.dyn_texts.push(DynText {
                             path: path.clone(),
-                            name: name.clone(),
-                            expr: value.clone(),
+                            expr: expr.clone(),
                         });
                     }
-                    str_attrs.push((name.clone(), value.clone()));
+                    let expr = expr.clone();
+                    self.c_text(&expr, ctx, out)?;
+                }
+                Child::For { .. } => unreachable!("handled above"),
+            }
+            path.pop();
+        }
+        Ok(())
+    }
+
+    /// Split an element's attributes: string attrs returned (key skipped),
+    /// event handlers registered as static handlers at `path`.
+    fn plain_attrs(&mut self, el: &Element, path: &[u32]) -> Result<Vec<(String, Expr)>, String> {
+        let mut plain = Vec::new();
+        for attr in &el.attrs {
+            match attr {
+                Attr::Str { name, value, .. } => {
+                    if name == "key" {
+                        continue; // regions replace wholesale; keys are inert
+                    }
+                    plain.push((name.clone(), value.clone()));
                 }
                 Attr::On {
                     event,
                     handler,
                     prevent_default,
                 } => {
-                    if handler.arg.is_some() {
-                        return Err(unsupported(handler.pos, "message arguments"));
-                    }
                     let msg = self.msg_index(&handler.name);
                     let pd = self.events.entry(event.clone()).or_insert(false);
                     *pd = *pd || *prevent_default;
                     self.handlers.push(Handler {
-                        path: path.clone(),
+                        prefix: path.to_vec(),
                         event: event.clone(),
                         msg,
-                        takes_payload: false,
+                        kind: HandlerKind::Static {
+                            takes_input: false,
+                            arg: handler.arg.clone(),
+                        },
                     });
                 }
                 Attr::OnValue {
@@ -344,55 +708,128 @@ impl<'a> Emitter<'a> {
                     let msg = self.msg_index(ctor);
                     self.events.entry(event.clone()).or_insert(false);
                     self.handlers.push(Handler {
-                        path: path.clone(),
+                        prefix: path.to_vec(),
                         event: event.clone(),
                         msg,
-                        takes_payload: true,
+                        kind: HandlerKind::Static {
+                            takes_input: true,
+                            arg: None,
+                        },
                     });
                 }
             }
         }
-        Self::c_wvu(out, str_attrs.len() as u32);
-        for (name, value) in str_attrs {
-            self.c_wstr(out, &name);
-            self.c_text(&value, out)?;
-        }
+        Ok(plain)
+    }
 
-        Self::c_wvu(out, el.children.len() as u32);
-        for (i, child) in el.children.iter().enumerate() {
-            path.push(i as u32);
-            match child {
-                Child::Elem(e) => self.walk(e, path, out)?,
-                Child::Text(expr, _) => {
-                    Self::c_w8(out, 0); // text node
-                    if !matches!(expr, Expr::Str(_)) {
-                        self.dyn_texts.push(DynText {
-                            path: path.clone(),
-                            expr: expr.clone(),
-                        });
-                    }
-                    let expr = expr.clone();
-                    self.c_text(&expr, out)?;
+    /// Register handlers found inside a region body (suffix-addressed).
+    fn collect_body_handlers(
+        &mut self,
+        el: &Element,
+        prefix: &[u32],
+        suffix: &mut Vec<u32>,
+        region: usize,
+        var: &str,
+        record: &str,
+    ) -> Result<(), String> {
+        for attr in &el.attrs {
+            match attr {
+                Attr::Str { .. } => {}
+                Attr::On {
+                    event,
+                    handler,
+                    prevent_default,
+                } => {
+                    let msg = self.msg_index(&handler.name);
+                    let pd = self.events.entry(event.clone()).or_insert(false);
+                    *pd = *pd || *prevent_default;
+                    self.handlers.push(Handler {
+                        prefix: prefix.to_vec(),
+                        event: event.clone(),
+                        msg,
+                        kind: HandlerKind::ForItem {
+                            region,
+                            suffix: suffix.clone(),
+                            arg: handler.arg.clone(),
+                            takes_input: false,
+                        },
+                    });
                 }
-                Child::For { pos, .. } => return Err(unsupported(*pos, "list rendering")),
+                Attr::OnValue {
+                    event,
+                    ctor,
+                    kind,
+                    pos,
+                } => {
+                    if *kind == ValueKind::Checked {
+                        return Err(unsupported(*pos, "`onCheck` (Bool payloads)"));
+                    }
+                    let msg = self.msg_index(ctor);
+                    self.events.entry(event.clone()).or_insert(false);
+                    self.handlers.push(Handler {
+                        prefix: prefix.to_vec(),
+                        event: event.clone(),
+                        msg,
+                        kind: HandlerKind::ForItem {
+                            region,
+                            suffix: suffix.clone(),
+                            arg: None,
+                            takes_input: true,
+                        },
+                    });
+                }
             }
-            path.pop();
         }
+        for (i, child) in el.children.iter().enumerate() {
+            suffix.push(i as u32);
+            match child {
+                Child::Elem(e) => {
+                    self.collect_body_handlers(e, prefix, suffix, region, var, record)?
+                }
+                Child::Text(..) => {}
+                Child::For { pos, .. } => {
+                    return Err(unsupported(*pos, "nested `for` regions"));
+                }
+            }
+            suffix.pop();
+        }
+        let _ = (var, record);
         Ok(())
     }
 
-    // --- expressions ---------------------------------------------------------
+    // --- expressions ----------------------------------------------------------
 
-    /// Push an i64 onto the wasm stack.
-    fn int_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
+    /// Push an i64.
+    fn int_expr(
+        &mut self,
+        e: &Expr,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
         match e {
             Expr::Int(n) => out.push(I::I64Const(*n)),
-            Expr::Field(base, field, pos) => {
-                self.model_field(base, field, *pos, out)?;
-            }
+            Expr::Var(v, pos) => match ctx.lookup(v) {
+                Some(Slot::PayloadInt) => out.push(I::GlobalGet(G_PAYLOAD_I64)),
+                _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
+            },
+            Expr::Field(..) => self.place(e, ctx, out)?,
+            Expr::Len(inner, _) => match inner.as_ref() {
+                // length(for … where c yield …) compiles to just the count.
+                Expr::For {
+                    var, list, cond, ..
+                } => {
+                    self.count_loop(var, list, cond.as_deref(), ctx, out)?;
+                    out.push(I::I64ExtendI32U);
+                }
+                _ => {
+                    self.list_expr(inner, ctx, out)?;
+                    out.push(I::ArrayLen);
+                    out.push(I::I64ExtendI32U);
+                }
+            },
             Expr::Bin(op @ (Op::Add | Op::Sub | Op::Mul), l, r, _) => {
-                self.int_expr(l, out)?;
-                self.int_expr(r, out)?;
+                self.int_expr(l, ctx, out)?;
+                self.int_expr(r, ctx, out)?;
                 out.push(match op {
                     Op::Add => I::I64Add,
                     Op::Sub => I::I64Sub,
@@ -400,11 +837,11 @@ impl<'a> Emitter<'a> {
                 });
             }
             Expr::If(c, t, f, _) => {
-                self.bool_expr(c, out)?;
+                self.bool_expr(c, ctx, out)?;
                 out.push(I::If(BlockType::Result(ValType::I64)));
-                self.int_expr(t, out)?;
+                self.int_expr(t, ctx, out)?;
                 out.push(I::Else);
-                self.int_expr(f, out)?;
+                self.int_expr(f, ctx, out)?;
                 out.push(I::End);
             }
             other => return Err(unsupported(pos_of(other), "this expression")),
@@ -412,8 +849,13 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// Push a `(ref null $str)` onto the wasm stack.
-    fn str_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
+    /// Push a `(ref null $str)`.
+    fn str_expr(
+        &mut self,
+        e: &Expr,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
         match e {
             Expr::Str(s) => {
                 let (off, len) = self.pool.intern(s);
@@ -424,31 +866,26 @@ impl<'a> Emitter<'a> {
                     array_data_index: 1,
                 });
             }
-            Expr::Var(v, pos) => {
-                if self.payload_var.as_deref() == Some(v) {
-                    out.push(I::GlobalGet(G_PAYLOAD));
-                } else {
-                    return Err(unsupported(*pos, &format!("variable `{v}`")));
-                }
-            }
-            Expr::Field(base, field, pos) => {
-                self.model_field(base, field, *pos, out)?;
-            }
+            Expr::Var(v, pos) => match ctx.lookup(v) {
+                Some(Slot::PayloadStr) => out.push(I::GlobalGet(G_PAYLOAD)),
+                _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
+            },
+            Expr::Field(..) => self.place(e, ctx, out)?,
             Expr::Show(inner, _) => {
-                self.int_expr(inner, out)?;
+                self.int_expr(inner, ctx, out)?;
                 out.push(I::Call(F_ITOA));
             }
             Expr::Bin(Op::Concat, l, r, _) => {
-                self.str_expr(l, out)?;
-                self.str_expr(r, out)?;
-                out.push(I::Call(F_CONCAT));
+                self.str_expr(l, ctx, out)?;
+                self.str_expr(r, ctx, out)?;
+                out.push(I::Call(F_CONCAT_STR));
             }
             Expr::If(c, t, f, _) => {
-                self.bool_expr(c, out)?;
+                self.bool_expr(c, ctx, out)?;
                 out.push(I::If(BlockType::Result(str_val())));
-                self.str_expr(t, out)?;
+                self.str_expr(t, ctx, out)?;
                 out.push(I::Else);
-                self.str_expr(f, out)?;
+                self.str_expr(f, ctx, out)?;
                 out.push(I::End);
             }
             other => return Err(unsupported(pos_of(other), "this text expression")),
@@ -456,53 +893,37 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// `model.<field>` -> struct.get (works for both i64 and str fields).
-    fn model_field(
+    /// Push an i32 boolean.
+    fn bool_expr(
         &mut self,
-        base: &Expr,
-        field: &str,
-        pos: Pos,
+        e: &Expr,
+        ctx: &mut Ctx,
         out: &mut Vec<I<'static>>,
     ) -> Result<(), String> {
-        let Expr::Var(m, _) = base else {
-            return Err(unsupported(pos, "nested field access"));
-        };
-        if m != "model" {
-            return Err(unsupported(pos, "variables other than `model`"));
-        }
-        out.push(I::GlobalGet(G_STATE));
-        out.push(I::StructGet {
-            struct_type_index: T_MODEL,
-            field_index: self.field_index(field),
-        });
-        Ok(())
-    }
-
-    /// Push an i32 boolean onto the wasm stack.
-    fn bool_expr(&mut self, e: &Expr, out: &mut Vec<I<'static>>) -> Result<(), String> {
         match e {
             Expr::Bool(b) => out.push(I::I32Const(*b as i32)),
             Expr::Not(inner, _) => {
-                self.bool_expr(inner, out)?;
+                self.bool_expr(inner, ctx, out)?;
                 out.push(I::I32Eqz);
             }
+            Expr::Field(..) => self.place(e, ctx, out)?, // Bool struct field (i32)
             Expr::Bin(op @ (Op::Eq | Op::Ne), l, r, _) => {
-                if self.ty_of(l) == Ty::Str {
-                    self.str_expr(l, out)?;
-                    self.str_expr(r, out)?;
+                if self.ty_of(l, ctx) == Ty::Str {
+                    self.str_expr(l, ctx, out)?;
+                    self.str_expr(r, ctx, out)?;
                     out.push(I::Call(F_STREQ));
                     if *op == Op::Ne {
                         out.push(I::I32Eqz);
                     }
                 } else {
-                    self.int_expr(l, out)?;
-                    self.int_expr(r, out)?;
+                    self.int_expr(l, ctx, out)?;
+                    self.int_expr(r, ctx, out)?;
                     out.push(if *op == Op::Eq { I::I64Eq } else { I::I64Ne });
                 }
             }
             Expr::Bin(op @ (Op::Lt | Op::Gt), l, r, _) => {
-                self.int_expr(l, out)?;
-                self.int_expr(r, out)?;
+                self.int_expr(l, ctx, out)?;
+                self.int_expr(r, ctx, out)?;
                 out.push(if *op == Op::Lt { I::I64LtS } else { I::I64GtS });
             }
             other => return Err(unsupported(pos_of(other), "this condition")),
@@ -510,31 +931,425 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
-    /// A model-field value by type (used by update arms and boot).
-    fn val_expr(&mut self, e: &Expr, ty: &Ty, out: &mut Vec<I<'static>>) -> Result<(), String> {
-        match ty {
-            Ty::Int => self.int_expr(e, out),
-            Ty::Str => self.str_expr(e, out),
-            _ => Err(unsupported(pos_of(e), "this field type")),
+    /// `model.<f>` or `<loopvar>.<f>` -> struct.get (any field type).
+    fn place(&mut self, e: &Expr, ctx: &mut Ctx, out: &mut Vec<I<'static>>) -> Result<(), String> {
+        let Expr::Field(base, field, pos) = e else {
+            return Err(unsupported(pos_of(e), "this access"));
+        };
+        let Expr::Var(v, _) = base.as_ref() else {
+            return Err(unsupported(*pos, "nested field access"));
+        };
+        if v == "model" {
+            out.push(I::GlobalGet(G_STATE));
+            out.push(I::StructGet {
+                struct_type_index: self.model_idx(),
+                field_index: self.field_index(field),
+            });
+            return Ok(());
+        }
+        match ctx.lookup(v) {
+            Some(Slot::Item(local, rec)) => {
+                out.push(I::LocalGet(local));
+                out.push(I::StructGet {
+                    struct_type_index: self.rec_idx(&rec),
+                    field_index: self.record_field_index(&rec, field),
+                });
+                Ok(())
+            }
+            _ => Err(unsupported(*pos, &format!("variable `{v}`"))),
         }
     }
 
-    // --- module assembly -----------------------------------------------------
+    /// Push a `(ref null $Rec)`.
+    fn rec_expr(
+        &mut self,
+        e: &Expr,
+        rec: &str,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        match e {
+            Expr::Var(v, pos) => match ctx.lookup(v) {
+                Some(Slot::Item(local, _)) => out.push(I::LocalGet(local)),
+                _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
+            },
+            Expr::RecordLit(fields, _) => {
+                for (fname, fty) in self.record_fields(rec).to_vec() {
+                    let expr = fields
+                        .iter()
+                        .find(|(n, _, _)| *n == fname)
+                        .map(|(_, e, _)| e.clone())
+                        .expect("typechecked: literal is total");
+                    self.val_expr(&expr, &fty, ctx, out)?;
+                }
+                out.push(I::StructNew(self.rec_idx(rec)));
+            }
+            Expr::RecordUpdate(base, overrides, _) => {
+                let rec_ty = ValType::Ref(nullable(self.rec_idx(rec)));
+                let base_local = ctx.tmp(rec_ty);
+                self.rec_expr(base, rec, ctx, out)?;
+                out.push(I::LocalSet(base_local));
+                for (i, (fname, fty)) in self.record_fields(rec).to_vec().iter().enumerate() {
+                    match overrides.iter().find(|(n, _, _)| n == fname) {
+                        Some((_, e, _)) => {
+                            let e = e.clone();
+                            self.val_expr(&e, fty, ctx, out)?;
+                        }
+                        None => {
+                            out.push(I::LocalGet(base_local));
+                            out.push(I::StructGet {
+                                struct_type_index: self.rec_idx(rec),
+                                field_index: i as u32,
+                            });
+                        }
+                    }
+                }
+                out.push(I::StructNew(self.rec_idx(rec)));
+            }
+            Expr::If(c, t, f, _) => {
+                self.bool_expr(c, ctx, out)?;
+                out.push(I::If(BlockType::Result(ValType::Ref(nullable(
+                    self.rec_idx(rec),
+                )))));
+                self.rec_expr(t, rec, ctx, out)?;
+                out.push(I::Else);
+                self.rec_expr(f, rec, ctx, out)?;
+                out.push(I::End);
+            }
+            other => return Err(unsupported(pos_of(other), "this record expression")),
+        }
+        Ok(())
+    }
+
+    /// Push a `(ref null $Arr<Rec>)`.
+    fn list_expr(
+        &mut self,
+        e: &Expr,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        match e {
+            Expr::Field(..) => self.place(e, ctx, out)?,
+            Expr::ListLit(items, pos) => {
+                let Ty::List(elem) = self.ty_of(e, ctx) else {
+                    return Err(unsupported(*pos, "this list"));
+                };
+                let Ty::Record(rec) = elem.as_ref() else {
+                    return Err(unsupported(*pos, "non-record list literals"));
+                };
+                // Empty literals get their type from init/update field types
+                // upstream — here they only appear record-typed.
+                for item in items.clone() {
+                    self.rec_expr(&item, rec, ctx, out)?;
+                }
+                out.push(I::ArrayNewFixed {
+                    array_type_index: self.arr_idx(rec),
+                    array_size: items.len() as u32,
+                });
+            }
+            Expr::Bin(Op::Concat, l, r, pos) => {
+                let Ty::List(elem) = self.ty_of(l, ctx) else {
+                    return Err(unsupported(*pos, "this concat"));
+                };
+                let Ty::Record(rec) = elem.as_ref() else {
+                    return Err(unsupported(*pos, "non-record list concat"));
+                };
+                let rec = rec.clone();
+                self.list_expr(l, ctx, out)?;
+                self.list_expr(r, ctx, out)?;
+                out.push(I::Call(self.f_arrcat(&rec)));
+            }
+            Expr::Reverse(inner, pos) => {
+                let Ty::List(elem) = self.ty_of(inner, ctx) else {
+                    return Err(unsupported(*pos, "this reverse"));
+                };
+                let Ty::Record(rec) = elem.as_ref() else {
+                    return Err(unsupported(*pos, "non-record list reverse"));
+                };
+                let rec = rec.clone();
+                self.list_expr(inner, ctx, out)?;
+                out.push(I::Call(self.f_arrrev(&rec)));
+            }
+            Expr::For {
+                var,
+                list,
+                cond,
+                body,
+                pos,
+            } => {
+                let Ty::List(elem) = self.ty_of(list, ctx) else {
+                    return Err(unsupported(*pos, "this comprehension source"));
+                };
+                let Ty::Record(rec) = elem.as_ref() else {
+                    return Err(unsupported(*pos, "comprehensions over non-record lists"));
+                };
+                let rec = rec.clone();
+                self.comprehension(var, list, cond.as_deref(), body, &rec, ctx, out)?;
+            }
+            other => return Err(unsupported(pos_of(other), "this list expression")),
+        }
+        Ok(())
+    }
+
+    /// A value of the given type (drives update arms, boot, record fields).
+    fn val_expr(
+        &mut self,
+        e: &Expr,
+        ty: &Ty,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        match ty {
+            Ty::Int => self.int_expr(e, ctx, out),
+            Ty::Str => self.str_expr(e, ctx, out),
+            Ty::Bool => self.bool_expr(e, ctx, out),
+            Ty::Record(r) => self.rec_expr(e, r, ctx, out),
+            Ty::List(elem) => {
+                let Ty::Record(rec) = elem.as_ref() else {
+                    return Err(unsupported(pos_of(e), "this list type"));
+                };
+                // Empty literals need the element type from the field.
+                if let Expr::ListLit(items, _) = e {
+                    if items.is_empty() {
+                        out.push(I::ArrayNewFixed {
+                            array_type_index: self.arr_idx(rec),
+                            array_size: 0,
+                        });
+                        return Ok(());
+                    }
+                }
+                self.list_expr(e, ctx, out)
+            }
+            Ty::Maybe(_) => Err(unsupported(pos_of(e), "`Maybe` values")),
+        }
+    }
+
+    /// The counting half of a comprehension: pushes an i32 count.
+    fn count_loop(
+        &mut self,
+        var: &str,
+        list: &Expr,
+        cond: Option<&Expr>,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let Ty::List(elem) = self.ty_of(list, ctx) else {
+            return Err(unsupported(pos_of(list), "this comprehension source"));
+        };
+        let Ty::Record(rec) = elem.as_ref() else {
+            return Err(unsupported(
+                pos_of(list),
+                "comprehensions over non-record lists",
+            ));
+        };
+        let rec = rec.clone();
+        let arr_ty = ValType::Ref(nullable(self.arr_idx(&rec)));
+        let rec_vt = ValType::Ref(nullable(self.rec_idx(&rec)));
+        let src = ctx.tmp(arr_ty);
+        let n = ctx.tmp(ValType::I32);
+        let i = ctx.tmp(ValType::I32);
+        let cnt = ctx.tmp(ValType::I32);
+        let t = ctx.tmp(rec_vt);
+
+        self.list_expr(list, ctx, out)?;
+        out.push(I::LocalSet(src));
+        out.push(I::LocalGet(src));
+        out.push(I::ArrayLen);
+        out.push(I::LocalSet(n));
+        out.push(I::I32Const(0));
+        out.push(I::LocalSet(i));
+        out.push(I::I32Const(0));
+        out.push(I::LocalSet(cnt));
+        match cond {
+            None => {
+                out.push(I::LocalGet(n));
+                out.push(I::LocalSet(cnt));
+            }
+            Some(c) => {
+                out.push(I::Block(BlockType::Empty));
+                out.push(I::Loop(BlockType::Empty));
+                out.push(I::LocalGet(i));
+                out.push(I::LocalGet(n));
+                out.push(I::I32GeU);
+                out.push(I::BrIf(1));
+                out.push(I::LocalGet(src));
+                out.push(I::LocalGet(i));
+                out.push(I::ArrayGet(self.arr_idx(&rec)));
+                out.push(I::LocalSet(t));
+                ctx.env.push((var.to_string(), Slot::Item(t, rec.clone())));
+                self.bool_expr(c, ctx, out)?;
+                ctx.env.pop();
+                out.push(I::If(BlockType::Empty));
+                out.push(I::LocalGet(cnt));
+                out.push(I::I32Const(1));
+                out.push(I::I32Add);
+                out.push(I::LocalSet(cnt));
+                out.push(I::End);
+                out.push(I::LocalGet(i));
+                out.push(I::I32Const(1));
+                out.push(I::I32Add);
+                out.push(I::LocalSet(i));
+                out.push(I::Br(0));
+                out.push(I::End);
+                out.push(I::End);
+            }
+        }
+        out.push(I::LocalGet(cnt));
+        Ok(())
+    }
+
+    /// Full comprehension: count pass (when filtered) + fill pass.
+    #[allow(clippy::too_many_arguments)]
+    fn comprehension(
+        &mut self,
+        var: &str,
+        list: &Expr,
+        cond: Option<&Expr>,
+        body: &Expr,
+        rec: &str,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let arr_idx = self.arr_idx(rec);
+        let arr_ty = ValType::Ref(nullable(arr_idx));
+        let rec_vt = ValType::Ref(nullable(self.rec_idx(rec)));
+        let src = ctx.tmp(arr_ty);
+        let n = ctx.tmp(ValType::I32);
+        let i = ctx.tmp(ValType::I32);
+        let w = ctx.tmp(ValType::I32);
+        let outp = ctx.tmp(arr_ty);
+        let t = ctx.tmp(rec_vt);
+
+        self.list_expr(list, ctx, out)?;
+        out.push(I::LocalSet(src));
+        out.push(I::LocalGet(src));
+        out.push(I::ArrayLen);
+        out.push(I::LocalSet(n));
+
+        // Size: n when unfiltered, else a counting pass.
+        match cond {
+            None => out.push(I::LocalGet(n)),
+            Some(c) => {
+                out.push(I::I32Const(0));
+                out.push(I::LocalSet(i));
+                out.push(I::I32Const(0));
+                out.push(I::LocalSet(w));
+                out.push(I::Block(BlockType::Empty));
+                out.push(I::Loop(BlockType::Empty));
+                out.push(I::LocalGet(i));
+                out.push(I::LocalGet(n));
+                out.push(I::I32GeU);
+                out.push(I::BrIf(1));
+                out.push(I::LocalGet(src));
+                out.push(I::LocalGet(i));
+                out.push(I::ArrayGet(arr_idx));
+                out.push(I::LocalSet(t));
+                ctx.env
+                    .push((var.to_string(), Slot::Item(t, rec.to_string())));
+                self.bool_expr(c, ctx, out)?;
+                ctx.env.pop();
+                out.push(I::If(BlockType::Empty));
+                out.push(I::LocalGet(w));
+                out.push(I::I32Const(1));
+                out.push(I::I32Add);
+                out.push(I::LocalSet(w));
+                out.push(I::End);
+                out.push(I::LocalGet(i));
+                out.push(I::I32Const(1));
+                out.push(I::I32Add);
+                out.push(I::LocalSet(i));
+                out.push(I::Br(0));
+                out.push(I::End);
+                out.push(I::End);
+                out.push(I::LocalGet(w));
+            }
+        }
+        out.push(I::ArrayNewDefault(arr_idx));
+        out.push(I::LocalSet(outp));
+
+        // Fill pass.
+        out.push(I::I32Const(0));
+        out.push(I::LocalSet(i));
+        out.push(I::I32Const(0));
+        out.push(I::LocalSet(w));
+        out.push(I::Block(BlockType::Empty));
+        out.push(I::Loop(BlockType::Empty));
+        out.push(I::LocalGet(i));
+        out.push(I::LocalGet(n));
+        out.push(I::I32GeU);
+        out.push(I::BrIf(1));
+        out.push(I::LocalGet(src));
+        out.push(I::LocalGet(i));
+        out.push(I::ArrayGet(arr_idx));
+        out.push(I::LocalSet(t));
+        ctx.env
+            .push((var.to_string(), Slot::Item(t, rec.to_string())));
+        let inner: Result<(), String> = (|| {
+            if let Some(c) = cond {
+                self.bool_expr(c, ctx, out)?;
+                out.push(I::If(BlockType::Empty));
+            }
+            out.push(I::LocalGet(outp));
+            out.push(I::LocalGet(w));
+            self.rec_expr(body, rec, ctx, out)?;
+            out.push(I::ArraySet(arr_idx));
+            out.push(I::LocalGet(w));
+            out.push(I::I32Const(1));
+            out.push(I::I32Add);
+            out.push(I::LocalSet(w));
+            if cond.is_some() {
+                out.push(I::End);
+            }
+            Ok(())
+        })();
+        ctx.env.pop();
+        inner?;
+        out.push(I::LocalGet(i));
+        out.push(I::I32Const(1));
+        out.push(I::I32Add);
+        out.push(I::LocalSet(i));
+        out.push(I::Br(0));
+        out.push(I::End);
+        out.push(I::End);
+        out.push(I::LocalGet(outp));
+        Ok(())
+    }
+
+    // --- module assembly -------------------------------------------------------
 
     fn module(mut self) -> Result<Vec<u8>, String> {
         let mut module = Module::new();
 
-        // Types. $str first so the model struct can reference it.
+        // Types: $str, record structs, record arrays, model, function types.
         let mut types = TypeSection::new();
         types.ty().array(&StorageType::I8, true);
+        for (_, fields) in &self.records.clone() {
+            types.ty().struct_(
+                fields
+                    .iter()
+                    .map(|(_, t)| FieldType {
+                        element_type: StorageType::Val(match t {
+                            Ty::Int => ValType::I64,
+                            Ty::Bool => ValType::I32,
+                            _ => str_val(),
+                        }),
+                        mutable: true,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        for i in 0..self.records.len() {
+            types.ty().array(
+                &StorageType::Val(ValType::Ref(nullable(1 + i as u32))),
+                true,
+            );
+        }
         types.ty().struct_(
             self.fields
+                .clone()
                 .iter()
                 .map(|(_, t)| FieldType {
-                    element_type: StorageType::Val(match t {
-                        Ty::Int => ValType::I64,
-                        _ => str_val(),
-                    }),
+                    element_type: StorageType::Val(self.val_type(t)),
                     mutable: true,
                 })
                 .collect::<Vec<_>>(),
@@ -553,19 +1368,42 @@ impl<'a> Emitter<'a> {
         types.ty().function([str_val(), str_val()], [str_val()]);
         types.ty().function([str_val(), str_val()], [ValType::I32]);
         types.ty().function([str_val()], []);
+        for i in 0..self.records.len() {
+            let arr = ValType::Ref(nullable(1 + self.n_records() + i as u32));
+            types.ty().function([arr, arr], [arr]);
+            types.ty().function([arr], [arr]);
+        }
         module.section(&types);
 
         // Functions.
         let mut funcs = FunctionSection::new();
         for ty in [
-            T_I32, T_I32, T_II, T_ITOA, T_MEM2STR, T_CONCAT, T_STREQ, T_WSTRGC, T_I32, T_VOID,
-            T_VOID, T_RET, T_DISPATCH,
+            self.t_i32(),
+            self.t_i32(),
+            self.t_ii(),
+            self.t_itoa(),
+            self.t_mem2str(),
+            self.t_concat_str(),
+            self.t_streq(),
+            self.t_wstrgc(),
         ] {
             funcs.function(ty);
         }
+        for i in 0..self.records.len() {
+            funcs.function(self.t_arrcat(i));
+            funcs.function(self.t_arrrev(i));
+        }
+        for _ in 0..self.regions.len() {
+            funcs.function(self.t_void());
+        }
+        funcs.function(self.t_i32()); // update
+        funcs.function(self.t_void()); // patches
+        funcs.function(self.t_void()); // boot
+        funcs.function(self.t_ret()); // init
+        funcs.function(self.t_dispatch()); // dispatch
         module.section(&funcs);
 
-        // Memory: 2 pages (wire buffer + constants + staging).
+        // Memory.
         let mut memory = MemorySection::new();
         memory.memory(MemoryType {
             minimum: 2,
@@ -580,14 +1418,11 @@ impl<'a> Emitter<'a> {
         let mut globals = GlobalSection::new();
         globals.global(
             GlobalType {
-                val_type: ValType::Ref(RefType {
-                    nullable: true,
-                    heap_type: HeapType::Concrete(T_MODEL),
-                }),
+                val_type: ValType::Ref(nullable(self.model_idx())),
                 mutable: true,
                 shared: false,
             },
-            &ConstExpr::ref_null(HeapType::Concrete(T_MODEL)),
+            &ConstExpr::ref_null(HeapType::Concrete(self.model_idx())),
         );
         globals.global(
             GlobalType {
@@ -621,48 +1456,63 @@ impl<'a> Emitter<'a> {
             },
             &ConstExpr::ref_null(HeapType::Concrete(T_STR)),
         );
+        globals.global(
+            GlobalType {
+                val_type: ValType::I64,
+                mutable: true,
+                shared: false,
+            },
+            &ConstExpr::i64_const(0),
+        );
         module.section(&globals);
 
         // Exports.
         let mut exports = ExportSection::new();
         exports.export("mem", ExportKind::Memory, 0);
-        exports.export("init", ExportKind::Func, F_INIT);
-        exports.export("dispatch", ExportKind::Func, F_DISPATCH);
+        exports.export("init", ExportKind::Func, self.f_init());
+        exports.export("dispatch", ExportKind::Func, self.f_dispatch());
         exports.export("path_buf", ExportKind::Global, G_PATH_BUF);
         exports.export("payload_buf", ExportKind::Global, G_PAYLOAD_BUF);
         module.section(&exports);
 
         module.section(&StartSection {
-            function_index: F_BOOT,
+            function_index: self.f_boot(),
         });
 
         // array.new_data requires a data-count section before code.
         module.section(&DataCountSection { count: 2 });
 
         // Code — order must match the function section.
-        let update = self.fn_update()?;
-        let patches = self.fn_patches()?;
-        let boot = self.fn_boot()?;
-        let init = self.fn_init()?;
-        let dispatch = self.fn_dispatch();
+        let mut bodies: Vec<Function> = vec![
+            self.fn_w8(),
+            self.fn_wvu(),
+            self.fn_wstr(),
+            self.fn_itoa(),
+            self.fn_mem2str(),
+            self.fn_concat_str(),
+            self.fn_streq(),
+            self.fn_wstrgc(),
+        ];
+        for i in 0..self.records.len() {
+            bodies.push(self.fn_arrcat(i));
+            bodies.push(self.fn_arrrev(i));
+        }
+        for j in 0..self.regions.len() {
+            bodies.push(self.fn_region(j)?);
+        }
+        bodies.push(self.fn_update()?);
+        bodies.push(self.fn_patches()?);
+        bodies.push(self.fn_boot()?);
+        bodies.push(self.fn_init()?);
+        bodies.push(self.fn_dispatch()?);
         let mut code = CodeSection::new();
-        code.function(&self.fn_w8());
-        code.function(&self.fn_wvu());
-        code.function(&self.fn_wstr());
-        code.function(&self.fn_itoa());
-        code.function(&self.fn_mem2str());
-        code.function(&self.fn_concat());
-        code.function(&self.fn_streq());
-        code.function(&self.fn_wstrgc());
-        code.function(&update);
-        code.function(&patches);
-        code.function(&boot);
-        code.function(&init);
-        code.function(&dispatch);
+        for b in &bodies {
+            code.function(b);
+        }
         module.section(&code);
 
-        // Data: segment 0 active (streamed by wstr via memory.copy),
-        // segment 1 passive (materialized by array.new_data). Same bytes.
+        // Data: segment 0 active (streamed by wstr), segment 1 passive
+        // (materialized by array.new_data). Same bytes.
         let mut data = DataSection::new();
         data.active(
             0,
@@ -675,7 +1525,8 @@ impl<'a> Emitter<'a> {
         Ok(module.finish())
     }
 
-    /// w8(b): mem[cursor++] = b
+    // --- emitted stdlib ---------------------------------------------------------
+
     fn fn_w8(&self) -> Function {
         let mut f = Function::new([]);
         for i in [
@@ -697,9 +1548,8 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// wvu(n): unsigned LEB128.
     fn fn_wvu(&self) -> Function {
-        let mut f = Function::new([(1, ValType::I32)]); // local 1 = b
+        let mut f = Function::new([(1, ValType::I32)]);
         for i in [
             I::Loop(BlockType::Empty),
             I::LocalGet(0),
@@ -716,12 +1566,12 @@ impl<'a> Emitter<'a> {
             I::I32Const(0x80),
             I::I32Or,
             I::Call(F_W8),
-            I::Br(1), // continue the loop
+            I::Br(1),
             I::Else,
             I::LocalGet(1),
             I::Call(F_W8),
             I::End,
-            I::End, // loop exits when the else branch ran
+            I::End,
             I::End,
         ] {
             f.instruction(&i);
@@ -729,15 +1579,14 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// wstr(addr, len): varint length + bytes copied from linear memory.
     fn fn_wstr(&self) -> Function {
         let mut f = Function::new([]);
         for i in [
             I::LocalGet(1),
             I::Call(F_WVU),
-            I::GlobalGet(G_CURSOR), // dst
-            I::LocalGet(0),         // src
-            I::LocalGet(1),         // size
+            I::GlobalGet(G_CURSOR),
+            I::LocalGet(0),
+            I::LocalGet(1),
             I::MemoryCopy {
                 src_mem: 0,
                 dst_mem: 0,
@@ -753,13 +1602,10 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// itoa(n) -> str: decimal digits of an i64 as a fresh GC string.
-    /// (i64::MIN renders wrong through the negate; acceptable for now.)
+    /// itoa(n) -> str. (i64::MIN renders wrong through the negate; fine.)
     fn fn_itoa(&self) -> Function {
-        // params: 0 = n (i64); locals: 1 = p, 2 = neg (i32), 3 = s, 4 = i
         let mut f = Function::new([(2, ValType::I32), (1, str_val()), (1, ValType::I32)]);
         let mut ins: Vec<I<'static>> = Vec::new();
-        // if n < 0 { neg = 1; n = 0 - n }
         ins.extend([
             I::LocalGet(0),
             I::I64Const(0),
@@ -772,9 +1618,6 @@ impl<'a> Emitter<'a> {
             I::I64Sub,
             I::LocalSet(0),
             I::End,
-        ]);
-        // do { scratch[p++] = '0' + n % 10; n /= 10 } while n != 0
-        ins.extend([
             I::Loop(BlockType::Empty),
             I::I32Const(SCRATCH),
             I::LocalGet(1),
@@ -803,9 +1646,6 @@ impl<'a> Emitter<'a> {
             I::I64Ne,
             I::BrIf(0),
             I::End,
-        ]);
-        // s = new array(p + neg); s[0] = '-' when negative.
-        ins.extend([
             I::LocalGet(1),
             I::LocalGet(2),
             I::I32Add,
@@ -815,12 +1655,9 @@ impl<'a> Emitter<'a> {
             I::If(BlockType::Empty),
             I::LocalGet(3),
             I::I32Const(0),
-            I::I32Const(45), // '-'
+            I::I32Const(45),
             I::ArraySet(T_STR),
             I::End,
-        ]);
-        // for i in 0..p: s[neg + i] = scratch[p - 1 - i]
-        ins.extend([
             I::Block(BlockType::Empty),
             I::Loop(BlockType::Empty),
             I::LocalGet(4),
@@ -860,10 +1697,7 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// mem2str(addr, len) -> str: build a GC string from linear memory
-    /// (the payload staging buffer).
     fn fn_mem2str(&self) -> Function {
-        // params: 0 = addr, 1 = len; locals: 2 = i, 3 = s
         let mut f = Function::new([(1, ValType::I32), (1, str_val())]);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.extend([
@@ -903,9 +1737,7 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// concat(a, b) -> str.
-    fn fn_concat(&self) -> Function {
-        // params: 0 = a, 1 = b; locals: 2 = la, 3 = lb, 4 = s
+    fn fn_concat_str(&self) -> Function {
         let mut f = Function::new([(2, ValType::I32), (1, str_val())]);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.extend([
@@ -947,9 +1779,7 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// streq(a, b) -> i32.
     fn fn_streq(&self) -> Function {
-        // params: 0 = a, 1 = b; locals: 2 = i, 3 = la
         let mut f = Function::new([(2, ValType::I32)]);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.extend([
@@ -997,9 +1827,7 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// wstrgc(s): varint length + the GC string's bytes into the wire buffer.
     fn fn_wstrgc(&self) -> Function {
-        // params: 0 = s; locals: 1 = i, 2 = l
         let mut f = Function::new([(2, ValType::I32)]);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.extend([
@@ -1033,22 +1861,228 @@ impl<'a> Emitter<'a> {
         f
     }
 
-    /// update(msg): record-update semantics — new values computed against the
-    /// pre-update model into locals, then struct.set. A message with a String
-    /// payload reads it from the payload global (set by dispatch).
+    /// Per-record array concat: (a, b) -> new array.
+    fn fn_arrcat(&self, rec: usize) -> Function {
+        let arr = 1 + self.n_records() + rec as u32;
+        let arr_vt = ValType::Ref(nullable(arr));
+        let mut f = Function::new([(2, ValType::I32), (1, arr_vt)]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(2),
+            I::LocalGet(1),
+            I::ArrayLen,
+            I::LocalSet(3),
+            I::LocalGet(2),
+            I::LocalGet(3),
+            I::I32Add,
+            I::ArrayNewDefault(arr),
+            I::LocalSet(4),
+            I::LocalGet(4),
+            I::I32Const(0),
+            I::LocalGet(0),
+            I::I32Const(0),
+            I::LocalGet(2),
+            I::ArrayCopy {
+                array_type_index_dst: arr,
+                array_type_index_src: arr,
+            },
+            I::LocalGet(4),
+            I::LocalGet(2),
+            I::LocalGet(1),
+            I::I32Const(0),
+            I::LocalGet(3),
+            I::ArrayCopy {
+                array_type_index_dst: arr,
+                array_type_index_src: arr,
+            },
+            I::LocalGet(4),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    /// Per-record array reverse: (a) -> new array.
+    fn fn_arrrev(&self, rec: usize) -> Function {
+        let arr = 1 + self.n_records() + rec as u32;
+        let arr_vt = ValType::Ref(nullable(arr));
+        let mut f = Function::new([(2, ValType::I32), (1, arr_vt)]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        // locals: 1 = n, 2 = i, 3 = out (params: 0 = a)
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(1),
+            I::LocalGet(1),
+            I::ArrayNewDefault(arr),
+            I::LocalSet(3),
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(2),
+            I::LocalGet(1),
+            I::I32GeU,
+            I::BrIf(1),
+            I::LocalGet(3),
+            I::LocalGet(2),
+            I::LocalGet(0),
+            I::LocalGet(1),
+            I::I32Const(1),
+            I::I32Sub,
+            I::LocalGet(2),
+            I::I32Sub,
+            I::ArrayGet(arr),
+            I::ArraySet(arr),
+            I::LocalGet(2),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(2),
+            I::Br(0),
+            I::End,
+            I::End,
+            I::LocalGet(3),
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
+    // --- app functions -----------------------------------------------------------
+
+    /// region_j(): serialize the region's parent element wholesale — tag,
+    /// attrs, then one body element per list item with the loop var bound.
+    fn fn_region(&mut self, j: usize) -> Result<Function, String> {
+        let region = &self.regions[j];
+        let (tag, attrs, var, list, rec, body) = (
+            region.parent_tag.clone(),
+            region.parent_attrs.clone(),
+            region.var.clone(),
+            region.list.clone(),
+            region.record.clone(),
+            region.body.clone(),
+        );
+        let arr_idx = self.arr_idx(&rec);
+        let arr_vt = ValType::Ref(nullable(arr_idx));
+        let rec_vt = ValType::Ref(nullable(self.rec_idx(&rec)));
+
+        let mut ctx = Ctx::new(4); // fixed locals below occupy 0..=3
+        let mut ins: Vec<I<'static>> = Vec::new();
+        // fixed locals: 0 = src, 1 = n, 2 = i, 3 = t
+        Self::c_w8(&mut ins, 1);
+        self.c_wstr(&mut ins, &tag);
+        Self::c_wvu(&mut ins, attrs.len() as u32);
+        for (name, value) in &attrs {
+            let name = name.clone();
+            self.c_wstr(&mut ins, &name);
+            self.c_text(value, &mut ctx, &mut ins)?;
+        }
+        self.list_expr(&list, &mut ctx, &mut ins)?;
+        ins.push(I::LocalSet(0));
+        ins.push(I::LocalGet(0));
+        ins.push(I::ArrayLen);
+        ins.push(I::LocalSet(1));
+        ins.push(I::LocalGet(1));
+        ins.push(I::Call(F_WVU)); // children count
+        ins.push(I::Block(BlockType::Empty));
+        ins.push(I::Loop(BlockType::Empty));
+        ins.push(I::LocalGet(2));
+        ins.push(I::LocalGet(1));
+        ins.push(I::I32GeU);
+        ins.push(I::BrIf(1));
+        ins.push(I::LocalGet(0));
+        ins.push(I::LocalGet(2));
+        ins.push(I::ArrayGet(arr_idx));
+        ins.push(I::LocalSet(3));
+        ctx.env.push((var.clone(), Slot::Item(3, rec.clone())));
+        self.emit_body_element(&body, &mut ctx, &mut ins)?;
+        ctx.env.pop();
+        ins.push(I::LocalGet(2));
+        ins.push(I::I32Const(1));
+        ins.push(I::I32Add);
+        ins.push(I::LocalSet(2));
+        ins.push(I::Br(0));
+        ins.push(I::End);
+        ins.push(I::End);
+        ins.push(I::End);
+        Ok(ctx.into_function(&[arr_vt, ValType::I32, ValType::I32, rec_vt], &ins))
+    }
+
+    /// Serialize one region-body element (dynamics evaluated inline; no
+    /// separate patches — the region replaces wholesale).
+    fn emit_body_element(
+        &mut self,
+        el: &Element,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        Self::c_w8(out, 1);
+        let tag = el.tag.clone();
+        self.c_wstr(out, &tag);
+        let attrs: Vec<(String, Expr)> = el
+            .attrs
+            .iter()
+            .filter_map(|a| match a {
+                Attr::Str { name, value, .. } if name != "key" => {
+                    Some((name.clone(), value.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        Self::c_wvu(out, attrs.len() as u32);
+        for (name, value) in &attrs {
+            let name = name.clone();
+            self.c_wstr(out, &name);
+            self.c_text(value, ctx, out)?;
+        }
+        Self::c_wvu(out, el.children.len() as u32);
+        for child in &el.children {
+            match child {
+                Child::Elem(e) => self.emit_body_element(e, ctx, out)?,
+                Child::Text(expr, _) => {
+                    Self::c_w8(out, 0);
+                    let expr = expr.clone();
+                    self.c_text(&expr, ctx, out)?;
+                }
+                Child::For { pos, .. } => return Err(unsupported(*pos, "nested `for` regions")),
+            }
+        }
+        Ok(())
+    }
+
+    /// update(msg): record-update semantics against the pre-update model.
     fn fn_update(&mut self) -> Result<Function, String> {
         let updates = self.app.updates.clone();
+        let nfields = self.fields.len();
+        let field_types: Vec<ValType> = self
+            .fields
+            .clone()
+            .iter()
+            .map(|(_, t)| self.val_type(t))
+            .collect();
+        let mut ctx = Ctx::new(1 + nfields as u32);
         let mut ins: Vec<I<'static>> = Vec::new();
         for u in &updates {
             let k = self.msg_index(&u.msg);
-            self.payload_var = u.var.as_ref().map(|(v, _)| v.clone());
+            if let Some((v, _)) = &u.var {
+                let slot = match self.msg_payload(k) {
+                    Some(Ty::Str) => Slot::PayloadStr,
+                    Some(Ty::Int) => Slot::PayloadInt,
+                    _ => unreachable!("gated payload types"),
+                };
+                ctx.env.push((v.clone(), slot));
+            }
             ins.push(I::LocalGet(0));
             ins.push(I::I32Const(k as i32));
             ins.push(I::I32Eq);
             ins.push(I::If(BlockType::Empty));
             for (field, expr, _) in &u.fields {
                 let ty = self.field_ty(field);
-                self.val_expr(expr, &ty, &mut ins)?;
+                self.val_expr(expr, &ty, &mut ctx, &mut ins)?;
                 ins.push(I::LocalSet(1 + self.field_index(field)));
             }
             for (field, _, _) in &u.fields {
@@ -1056,40 +2090,22 @@ impl<'a> Emitter<'a> {
                 ins.push(I::GlobalGet(G_STATE));
                 ins.push(I::LocalGet(1 + idx));
                 ins.push(I::StructSet {
-                    struct_type_index: T_MODEL,
+                    struct_type_index: self.model_idx(),
                     field_index: idx,
                 });
             }
             ins.push(I::Return);
             ins.push(I::End);
-            self.payload_var = None;
+            if u.var.is_some() {
+                ctx.env.pop();
+            }
         }
         ins.push(I::End);
-        // One local per model field, typed to match.
-        let locals: Vec<(u32, ValType)> = self
-            .fields
-            .iter()
-            .map(|(_, t)| {
-                (
-                    1u32,
-                    if *t == Ty::Int {
-                        ValType::I64
-                    } else {
-                        str_val()
-                    },
-                )
-            })
-            .collect();
-        let mut f = Function::new(locals);
-        for i in &ins {
-            f.instruction(i);
-        }
-        Ok(f)
+        Ok(ctx.into_function(&field_types, &ins))
     }
 
-    /// patches(): the compile-time patch plan — SetText for each dynamic
-    /// text, SetAttr for each dynamic attribute, unconditionally
-    /// re-serialized. (Caching last values is a later optimization.)
+    /// patches(): SetText + SetAttr for scalar dynamics, then one Replace
+    /// per region, all unconditional. (Value caching is a later trim.)
     fn fn_patches(&mut self) -> Result<Function, String> {
         let texts: Vec<(Vec<u32>, Expr)> = self
             .dyn_texts
@@ -1101,16 +2117,18 @@ impl<'a> Emitter<'a> {
             .iter()
             .map(|d| (d.path.clone(), d.name.clone(), d.expr.clone()))
             .collect();
+        let regions: Vec<Vec<u32>> = self.regions.iter().map(|r| r.path.clone()).collect();
+        let mut ctx = Ctx::new(0);
         let mut ins: Vec<I<'static>> = Vec::new();
         Self::c_w8(&mut ins, WIRE_VERSION);
-        Self::c_wvu(&mut ins, (texts.len() + attrs.len()) as u32);
+        Self::c_wvu(&mut ins, (texts.len() + attrs.len() + regions.len()) as u32);
         for (path, expr) in &texts {
             Self::c_w8(&mut ins, 1); // setText
             Self::c_wvu(&mut ins, path.len() as u32);
             for seg in path {
                 Self::c_wvu(&mut ins, *seg);
             }
-            self.c_text(expr, &mut ins)?;
+            self.c_text(expr, &mut ctx, &mut ins)?;
         }
         for (path, name, expr) in &attrs {
             Self::c_w8(&mut ins, 2); // setAttr
@@ -1119,20 +2137,23 @@ impl<'a> Emitter<'a> {
                 Self::c_wvu(&mut ins, *seg);
             }
             self.c_wstr(&mut ins, name);
-            self.c_text(expr, &mut ins)?;
+            self.c_text(expr, &mut ctx, &mut ins)?;
+        }
+        for (j, path) in regions.iter().enumerate() {
+            Self::c_w8(&mut ins, 0); // replace
+            Self::c_wvu(&mut ins, path.len() as u32);
+            for seg in path {
+                Self::c_wvu(&mut ins, *seg);
+            }
+            ins.push(I::Call(self.f_region(j)));
         }
         for _ in 0..3 {
             Self::c_wvu(&mut ins, 0); // events, cmds, subs
         }
         ins.push(I::End);
-        let mut f = Function::new([]);
-        for i in &ins {
-            f.instruction(i);
-        }
-        Ok(f)
+        Ok(ctx.into_function(&[], &ins))
     }
 
-    /// boot(): model = struct.new(init values). Runs via the start section.
     fn fn_boot(&mut self) -> Result<Function, String> {
         let inits: Vec<(Expr, Ty)> = self
             .fields
@@ -1149,21 +2170,17 @@ impl<'a> Emitter<'a> {
                 (expr, ty.clone())
             })
             .collect();
+        let mut ctx = Ctx::new(0);
         let mut ins: Vec<I<'static>> = Vec::new();
         for (expr, ty) in &inits {
-            self.val_expr(expr, ty, &mut ins)?;
+            self.val_expr(expr, ty, &mut ctx, &mut ins)?;
         }
-        ins.push(I::StructNew(T_MODEL));
+        ins.push(I::StructNew(self.model_idx()));
         ins.push(I::GlobalSet(G_STATE));
         ins.push(I::End);
-        let mut f = Function::new([]);
-        for i in &ins {
-            f.instruction(i);
-        }
-        Ok(f)
+        Ok(ctx.into_function(&[], &ins))
     }
 
-    /// init(): full InitialRender — version, tree, events, no cmds/subs.
     fn fn_init(&mut self) -> Result<Function, String> {
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.push(I::I32Const(0));
@@ -1181,31 +2198,66 @@ impl<'a> Emitter<'a> {
         Self::c_wvu(&mut ins, 0);
         ins.push(I::GlobalGet(G_CURSOR));
         ins.push(I::End);
-        let mut f = Function::new([]);
+        // The walk already allocated any temps it needed.
+        let locals: Vec<(u32, ValType)> = self.init_ctx_locals.iter().map(|t| (1u32, *t)).collect();
+        let mut f = Function::new(locals);
         for i in &ins {
             f.instruction(i);
         }
         Ok(f)
     }
 
-    /// dispatch(event_idx, path_len, payload_len): deepest-first prefix match
-    /// over the compile-time handler table (bubbling); payload-taking
-    /// handlers materialize the staged bytes as a GC string first.
-    fn fn_dispatch(&self) -> Function {
+    /// dispatch(event_idx, path_len, payload_len): deepest-first prefix
+    /// match; region handlers bind the clicked item from the path index and
+    /// evaluate the message argument at dispatch time.
+    fn fn_dispatch(&mut self) -> Result<Function, String> {
+        let handlers: Vec<(Vec<u32>, String, u32, HandlerKindOwned)> = self
+            .handlers
+            .iter()
+            .map(|h| {
+                (
+                    h.prefix.clone(),
+                    h.event.clone(),
+                    h.msg,
+                    match &h.kind {
+                        HandlerKind::Static { takes_input, arg } => HandlerKindOwned::Static {
+                            takes_input: *takes_input,
+                            arg: arg.clone(),
+                        },
+                        HandlerKind::ForItem {
+                            region,
+                            suffix,
+                            arg,
+                            takes_input,
+                        } => HandlerKindOwned::ForItem {
+                            region: *region,
+                            suffix: suffix.clone(),
+                            arg: arg.clone(),
+                            takes_input: *takes_input,
+                        },
+                    },
+                )
+            })
+            .collect();
+        let mut ctx = Ctx::new(3);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.push(I::I32Const(0));
         ins.push(I::GlobalSet(G_CURSOR));
-        for h in &self.handlers {
+        for (prefix, event, msg, kind) in &handlers {
             ins.push(I::Block(BlockType::Empty));
             ins.push(I::LocalGet(0));
-            ins.push(I::I32Const(self.event_code(&h.event)));
+            ins.push(I::I32Const(self.event_code(event)));
             ins.push(I::I32Ne);
             ins.push(I::BrIf(0));
+            let total = match kind {
+                HandlerKindOwned::Static { .. } => prefix.len(),
+                HandlerKindOwned::ForItem { suffix, .. } => prefix.len() + 1 + suffix.len(),
+            };
             ins.push(I::LocalGet(1));
-            ins.push(I::I32Const(h.path.len() as i32));
+            ins.push(I::I32Const(total as i32));
             ins.push(I::I32LtU);
             ins.push(I::BrIf(0));
-            for (i, seg) in h.path.iter().enumerate() {
+            for (i, seg) in prefix.iter().enumerate() {
                 ins.push(I::I32Const(PATH_BUF + 4 * i as i32));
                 ins.push(I::I32Load(MemArg {
                     offset: 0,
@@ -1216,32 +2268,125 @@ impl<'a> Emitter<'a> {
                 ins.push(I::I32Ne);
                 ins.push(I::BrIf(0));
             }
-            if h.takes_payload && self.msg_takes_payload(h.msg) {
-                ins.push(I::I32Const(PAYLOAD_BUF));
-                ins.push(I::LocalGet(2));
-                ins.push(I::Call(F_MEM2STR));
-                ins.push(I::GlobalSet(G_PAYLOAD));
+            match kind {
+                HandlerKindOwned::Static { takes_input, arg } => {
+                    if *takes_input {
+                        ins.push(I::I32Const(PAYLOAD_BUF));
+                        ins.push(I::LocalGet(2));
+                        ins.push(I::Call(F_MEM2STR));
+                        ins.push(I::GlobalSet(G_PAYLOAD));
+                    }
+                    if let Some(arg) = arg {
+                        self.emit_arg(arg, *msg, &mut ctx, &mut ins)?;
+                    }
+                }
+                HandlerKindOwned::ForItem {
+                    region,
+                    suffix,
+                    arg,
+                    takes_input,
+                } => {
+                    let r = &self.regions[*region];
+                    let (var, list, rec) = (r.var.clone(), r.list.clone(), r.record.clone());
+                    let arr_idx = self.arr_idx(&rec);
+                    let src = ctx.tmp(ValType::Ref(nullable(arr_idx)));
+                    let kk = ctx.tmp(ValType::I32);
+                    let t = ctx.tmp(ValType::Ref(nullable(self.rec_idx(&rec))));
+                    for (i, seg) in suffix.iter().enumerate() {
+                        ins.push(I::I32Const(PATH_BUF + 4 * (prefix.len() + 1 + i) as i32));
+                        ins.push(I::I32Load(MemArg {
+                            offset: 0,
+                            align: 2,
+                            memory_index: 0,
+                        }));
+                        ins.push(I::I32Const(*seg as i32));
+                        ins.push(I::I32Ne);
+                        ins.push(I::BrIf(0));
+                    }
+                    // k = path[prefix.len()]; bounds-check against the list.
+                    self.list_expr(&list, &mut ctx, &mut ins)?;
+                    ins.push(I::LocalSet(src));
+                    ins.push(I::I32Const(PATH_BUF + 4 * prefix.len() as i32));
+                    ins.push(I::I32Load(MemArg {
+                        offset: 0,
+                        align: 2,
+                        memory_index: 0,
+                    }));
+                    ins.push(I::LocalSet(kk));
+                    ins.push(I::LocalGet(kk));
+                    ins.push(I::LocalGet(src));
+                    ins.push(I::ArrayLen);
+                    ins.push(I::I32GeU);
+                    ins.push(I::BrIf(0));
+                    ins.push(I::LocalGet(src));
+                    ins.push(I::LocalGet(kk));
+                    ins.push(I::ArrayGet(arr_idx));
+                    ins.push(I::LocalSet(t));
+                    if *takes_input {
+                        ins.push(I::I32Const(PAYLOAD_BUF));
+                        ins.push(I::LocalGet(2));
+                        ins.push(I::Call(F_MEM2STR));
+                        ins.push(I::GlobalSet(G_PAYLOAD));
+                    }
+                    if let Some(arg) = arg {
+                        ctx.env.push((var, Slot::Item(t, rec)));
+                        let res = self.emit_arg(arg, *msg, &mut ctx, &mut ins);
+                        ctx.env.pop();
+                        res?;
+                    }
+                }
             }
-            ins.push(I::I32Const(h.msg as i32));
-            ins.push(I::Call(F_UPDATE));
-            ins.push(I::Call(F_PATCHES));
+            ins.push(I::I32Const(*msg as i32));
+            ins.push(I::Call(self.f_update()));
+            ins.push(I::Call(self.f_patches()));
             ins.push(I::GlobalGet(G_CURSOR));
             ins.push(I::Return);
             ins.push(I::End);
         }
-        // No handler matched: empty update.
         Self::c_w8(&mut ins, WIRE_VERSION);
         for _ in 0..4 {
             Self::c_wvu(&mut ins, 0);
         }
         ins.push(I::GlobalGet(G_CURSOR));
         ins.push(I::End);
-        let mut f = Function::new([]);
-        for i in &ins {
-            f.instruction(i);
-        }
-        f
+        Ok(ctx.into_function(&[], &ins))
     }
+
+    /// Evaluate a handler's message argument into the right payload global.
+    fn emit_arg(
+        &mut self,
+        arg: &Expr,
+        msg: u32,
+        ctx: &mut Ctx,
+        ins: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        match self.msg_payload(msg) {
+            Some(Ty::Int) => {
+                self.int_expr(arg, ctx, ins)?;
+                ins.push(I::GlobalSet(G_PAYLOAD_I64));
+            }
+            Some(Ty::Str) => {
+                self.str_expr(arg, ctx, ins)?;
+                ins.push(I::GlobalSet(G_PAYLOAD));
+            }
+            _ => return Err(unsupported(pos_of(arg), "this message argument")),
+        }
+        Ok(())
+    }
+}
+
+/// Owned mirror of HandlerKind so dispatch can iterate without aliasing self.
+enum HandlerKindOwned {
+    Static {
+        takes_input: bool,
+        arg: Option<Expr>,
+    },
+    ForItem {
+        region: usize,
+        suffix: Vec<u32>,
+        arg: Option<Expr>,
+        takes_input: bool,
+    },
 }
 
 fn pos_of(e: &Expr) -> Pos {
@@ -1273,81 +2418,51 @@ fn pos_of(e: &Expr) -> Pos {
 mod tests {
     use super::*;
 
-    const COUNTER: &str = r#"
-app Counter
-model { count: Int }
-init = { count = 0 }
-msg Inc | Dec | Reset
-update Inc = { count = model.count + 1 }
-update Dec = { count = model.count - 1 }
-update Reset = { count = 0 }
-view =
-  div [class "counter"] [
-    h1 [] [ text "zumar-lang" ],
-    div [class "row"] [
-      button [onClick Dec] [ text "-" ],
-      span [class "count"] [ text show(model.count) ],
-      button [onClick Inc] [ text "+" ]
-    ],
-    button [class "reset", onClick Reset] [ text "reset" ],
-    p [class "note"] [ text (if model.count > 9 then "double digits!" else "") ]
-  ]
-"#;
-
-    const HELLO: &str = r#"
-app Hello
-model { name: String, taps: Int }
-init = { name = "", taps = 0 }
-msg Name String | Clear
-update Name s = { name = s }
-update Clear = { name = "", taps = model.taps + 1 }
-view =
-  div [] [
-    input [type "text", value model.name, onInput Name] [],
-    p [] [ text (if model.name == "" then "?" else "kaixo, " ++ model.name) ],
-    button [onClick Clear] [ text "clear" ]
-  ]
-"#;
-
     fn emit_src(src: &str) -> Result<Vec<u8>, String> {
         emit(&zumar_lang::compile(src).unwrap())
     }
 
-    #[test]
-    fn counter_emits_a_valid_gc_module() {
-        let bytes = emit_src(COUNTER).unwrap();
+    fn assert_valid(src: &str) -> Vec<u8> {
+        let bytes = emit_src(src).unwrap();
         wasmparser::Validator::new()
             .validate_all(&bytes)
             .unwrap_or_else(|e| panic!("emitted module is invalid: {e}"));
+        bytes
+    }
+
+    #[test]
+    fn counter_emits_a_valid_gc_module() {
+        assert_valid(include_str!("../../../examples/lang-counter/counter.zu"));
+    }
+
+    #[test]
+    fn hello_with_gc_strings_emits_a_valid_module() {
+        assert_valid(include_str!("../../../examples/lang-hello/hello.zu"));
+    }
+
+    #[test]
+    fn todo_with_records_and_regions_emits_a_valid_module() {
+        let bytes = assert_valid(include_str!("../../../examples/lang-todo/todo.zu"));
         assert!(
-            bytes.len() < 8192,
-            "module unexpectedly large: {} bytes",
+            bytes.len() < 16384,
+            "unexpectedly large: {} bytes",
             bytes.len()
         );
     }
 
     #[test]
-    fn hello_with_gc_strings_emits_a_valid_module() {
-        let bytes = emit_src(HELLO).unwrap();
-        wasmparser::Validator::new()
-            .validate_all(&bytes)
-            .unwrap_or_else(|e| panic!("emitted module is invalid: {e}"));
-    }
-
-    #[test]
-    fn unsupported_features_error_cleanly() {
+    fn maybe_still_errors_cleanly() {
         let src = r#"
-app T
-record Item { id: Int }
-model { n: Int }
-init = { n = 0 }
-msg M
-update M = { n = 1 }
+app M
+record C { id: Int }
+model { pick: Maybe C }
+init = { pick = none }
+msg Set
+update Set = { pick = none }
 view = div [] []
 "#;
         let app = zumar_lang::compile(src).unwrap();
         let err = emit(&app).unwrap_err();
-        assert!(err.contains("record types"), "{err}");
         assert!(err.contains("not yet in the wasmgc backend"), "{err}");
     }
 
@@ -1355,11 +2470,11 @@ view = div [] []
     fn bool_payloads_error_cleanly() {
         let src = r#"
 app B
-model { on: Bool }
-init = { on = false }
+model { on: Int }
+init = { on = 0 }
 msg Flip Bool
-update Flip b = { on = b }
-view = div [] [ input [type "checkbox", onCheck Flip] [] ]
+update Flip b = { on = if b then 1 else 0 }
+view = div [] []
 "#;
         let app = zumar_lang::compile(src).unwrap();
         let err = emit(&app).unwrap_err();

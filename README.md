@@ -136,12 +136,17 @@ verbatim.
 - `crates/zumar-core` — vdom, diff, patch types. No wasm, no DOM.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
 - `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
-- `crates/zumar-wasmgc` — the WasmGC backend, spike stage: `zuc-gc` compiles
-  the counter subset of `.zu` straight to a self-contained GC binary via
-  `wasm-encoder` — no Rust toolchain, no wasm-bindgen, no runtime. The
-  counter is 1.3 KB (vs ~57 KB through the Rust backend), and instead of a
-  runtime diff it emits a compile-time patch plan: views are static, so the
-  compiler knows exactly which text nodes to re-serialize per update.
+- `crates/zumar-wasmgc` — the WasmGC backend: `zuc-gc` compiles `.zu`
+  straight to a self-contained GC binary via `wasm-encoder` — no Rust
+  toolchain, no wasm-bindgen, no runtime. Records are GC structs, lists are
+  GC arrays, strings are `array i8`. Instead of a runtime diff it emits a
+  compile-time patch plan; a `for` becomes a region that re-serializes into
+  one Replace patch, and handlers inside it resolve their message argument
+  (`Toggle(t.id)`) from the clicked item's path index at dispatch time. The
+  full todo app is 3 KB (vs ~57 KB through the Rust backend); counter is
+  1.7 KB. `www/zumar-gc.js` adapts the raw exports to the standard shim, so
+  GC modules run in normal browser pages. Not yet there: `Maybe`, Bool
+  payloads, nested `for`, effects.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
   and lang-counter / lang-todo / lang-expenses / lang-queue (compiled from `.zu`).
 - `spikes/wasmgc` — findings + harnesses for the GC backend.
@@ -188,8 +193,9 @@ python3 -m http.server 8765 -d www
 6. ~~WasmGC backend spike: `zuc-gc` emits the counter subset as a 1.3 KB
    self-contained GC module (compile-time patch plans instead of a runtime
    diff; findings in `spikes/wasmgc`)~~
-7. next: grow the GC backend toward the full language (strings/records on
-   the GC heap, `for` regions, payload staging); user-defined sum types +
-   general pattern matching; effects syntax.
+7. ~~GC backend: strings, records, `for` regions, payloads — counter,
+   hello, and todo all run on it~~
+8. next: user-defined sum types + general pattern matching; effects (both
+   backends); GC backend gaps (`Maybe`, Bool payloads, nested `for`).
 
 MIT.
