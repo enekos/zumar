@@ -1,3 +1,4 @@
 target/
 examples/*/www/pkg/
-examples/lang-counter/app/target/
+examples/*/app/
+spikes/wasmgc/*.wasm
