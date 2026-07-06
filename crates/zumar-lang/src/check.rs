@@ -15,13 +15,46 @@ type Fields = Vec<(String, Ty)>;
 /// A lexical scope: innermost bindings last.
 type Env = Vec<(String, Ty)>;
 
-pub fn check(app: &App) -> Result<(), ZuError> {
+pub fn check(app: &mut App) -> Result<(), ZuError> {
+    // Named types parse as Record(name); resolve the enum ones first.
+    let enum_names: BTreeSet<String> = app.enums.iter().map(|e| e.name.clone()).collect();
+    for (_, ty, _) in &mut app.model {
+        resolve_ty(ty, &enum_names);
+    }
+    for r in &mut app.records {
+        for (_, ty, _) in &mut r.fields {
+            resolve_ty(ty, &enum_names);
+        }
+    }
+    for m in &mut app.msgs {
+        if let Some(ty) = &mut m.payload {
+            resolve_ty(ty, &enum_names);
+        }
+    }
+    for e in &mut app.enums {
+        for (_, payload, _) in &mut e.variants {
+            if let Some(ty) = payload {
+                resolve_ty(ty, &enum_names);
+            }
+        }
+    }
     Checker::build(app)?.run(app)
+}
+
+fn resolve_ty(ty: &mut Ty, enums: &BTreeSet<String>) {
+    match ty {
+        Ty::Record(n) if enums.contains(n) => *ty = Ty::Enum(n.clone()),
+        Ty::List(t) | Ty::Maybe(t) => resolve_ty(t, enums),
+        _ => {}
+    }
 }
 
 struct Checker {
     records: BTreeMap<String, Fields>,
     msgs: BTreeMap<String, Option<Ty>>,
+    enums: BTreeMap<String, Vec<(String, Option<Ty>)>>,
+    /// Constructor -> owning enum (variants share one namespace).
+    variant_owner: BTreeMap<String, String>,
 }
 
 impl Checker {
@@ -86,7 +119,51 @@ impl Checker {
             }
         }
 
-        Ok(Checker { records, msgs })
+        let mut enums: BTreeMap<String, Vec<(String, Option<Ty>)>> = BTreeMap::new();
+        let mut variant_owner = BTreeMap::new();
+        for e in &app.enums {
+            if e.name == MODEL || records.contains_key(&e.name) {
+                return Err(ZuError::at(
+                    e.pos,
+                    format!("`{}` is already a record or reserved name", e.name),
+                ));
+            }
+            let mut variants = Vec::new();
+            for (vname, payload, vpos) in &e.variants {
+                if variant_owner
+                    .insert(vname.clone(), e.name.clone())
+                    .is_some()
+                {
+                    return Err(ZuError::at(
+                        *vpos,
+                        format!("constructor `{vname}` is already declared (variants share one namespace)"),
+                    ));
+                }
+                if msgs.contains_key(vname) {
+                    return Err(ZuError::at(
+                        *vpos,
+                        format!("`{vname}` is already a message name"),
+                    ));
+                }
+                variants.push((vname.clone(), payload.clone()));
+            }
+            if enums.insert(e.name.clone(), variants).is_some() {
+                return Err(ZuError::at(e.pos, format!("duplicate enum `{}`", e.name)));
+            }
+        }
+
+        Ok(Checker {
+            records,
+            msgs,
+            enums,
+            variant_owner,
+        })
+    }
+
+    fn enum_is_plain(&self, name: &str) -> bool {
+        self.enums
+            .get(name)
+            .is_some_and(|vs| vs.iter().all(|(_, p)| p.is_none()))
     }
 
     fn model(&self) -> &Fields {
@@ -376,12 +453,43 @@ impl Checker {
             Expr::Int(_) => Ok(Ty::Int),
             Expr::Str(_) => Ok(Ty::Str),
             Expr::Bool(_) => Ok(Ty::Bool),
-            Expr::Var(name, pos) => env
-                .iter()
-                .rev()
-                .find(|(n, _)| n == name)
-                .map(|(_, t)| t.clone())
-                .ok_or_else(|| ZuError::at(*pos, format!("`{name}` is not in scope"))),
+            Expr::Var(name, pos) => {
+                if let Some((_, t)) = env.iter().rev().find(|(n, _)| n == name) {
+                    return Ok(t.clone());
+                }
+                match self.variant_owner.get(name) {
+                    Some(owner) => {
+                        let payload = self.enums[owner]
+                            .iter()
+                            .find(|(v, _)| v == name)
+                            .and_then(|(_, p)| p.clone());
+                        match payload {
+                            None => Ok(Ty::Enum(owner.clone())),
+                            Some(t) => Err(ZuError::at(
+                                *pos,
+                                format!("`{name}` needs a {t} argument: `{name}(...)`"),
+                            )),
+                        }
+                    }
+                    None => Err(ZuError::at(*pos, format!("`{name}` is not in scope"))),
+                }
+            }
+            Expr::Ctor(name, arg, pos) => match self.variant_owner.get(name) {
+                Some(owner) => {
+                    let payload = self.enums[owner]
+                        .iter()
+                        .find(|(v, _)| v == name)
+                        .and_then(|(_, p)| p.clone());
+                    match payload {
+                        Some(t) => {
+                            self.expect(arg, &t, env, &format!("argument to `{name}`"))?;
+                            Ok(Ty::Enum(owner.clone()))
+                        }
+                        None => Err(ZuError::at(*pos, format!("`{name}` takes no argument"))),
+                    }
+                }
+                None => Err(ZuError::at(*pos, format!("`{name}` is not a declared constructor"))),
+            },
             Expr::Field(base, field, pos) => {
                 let bt = self.infer(base, None, env)?;
                 let Ty::Record(rec) = &bt else {
@@ -446,19 +554,124 @@ impl Checker {
                 let t = self.infer(inner, hint.as_ref(), env)?;
                 Ok(Ty::Maybe(Box::new(t)))
             }
-            Expr::Case { scrut, none_arm, some_var, some_arm, pos } => {
-                let inner = match self.infer(scrut, None, env)? {
-                    Ty::Maybe(t) => *t,
-                    other => return Err(ZuError::at(*pos, format!("`case` scrutinee must be a Maybe, got {other}"))),
-                };
-                let none_ty = self.infer(none_arm, expected, env)?;
-                let mut some_env = env.clone();
-                some_env.push((some_var.clone(), inner));
-                let some_ty = self.infer(some_arm, expected, &some_env)?;
-                if none_ty != some_ty {
-                    return Err(ZuError::at(*pos, format!("`case` arms disagree: none is {none_ty}, some is {some_ty}")));
+            Expr::Case { scrut, arms, pos } => {
+                let sty = self.infer(scrut, None, env)?;
+                let mut body_ty: Option<Ty> = None;
+                let mut check_body =
+                    |this: &Checker, arm: &CaseArm, bound: Option<Ty>| -> Result<(), ZuError> {
+                        let ty = match bound {
+                            Some(bt) => {
+                                let mut inner = env.clone();
+                                inner.push((arm.binder.clone().unwrap(), bt));
+                                this.infer(&arm.body, expected, &inner)?
+                            }
+                            None => this.infer(&arm.body, expected, env)?,
+                        };
+                        match &body_ty {
+                            None => body_ty = Some(ty),
+                            Some(prev) if *prev != ty => {
+                                return Err(ZuError::at(
+                                    arm.pos,
+                                    format!("`case` arms disagree: this arm is {ty}, earlier arms are {prev}"),
+                                ))
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    };
+                match &sty {
+                    Ty::Maybe(inner) => {
+                        let mut seen_none = false;
+                        let mut seen_some = false;
+                        for arm in arms {
+                            match arm.ctor.as_str() {
+                                "none" => {
+                                    if arm.binder.is_some() {
+                                        return Err(ZuError::at(arm.pos, "`none` takes no binder"));
+                                    }
+                                    if seen_none {
+                                        return Err(ZuError::at(arm.pos, "duplicate `none` arm"));
+                                    }
+                                    seen_none = true;
+                                    check_body(self, arm, None)?;
+                                }
+                                "some" => {
+                                    if arm.binder.is_none() {
+                                        return Err(ZuError::at(arm.pos, "`some` needs a binder: `some x ->`"));
+                                    }
+                                    if seen_some {
+                                        return Err(ZuError::at(arm.pos, "duplicate `some` arm"));
+                                    }
+                                    seen_some = true;
+                                    check_body(self, arm, Some(inner.as_ref().clone()))?;
+                                }
+                                other => {
+                                    return Err(ZuError::at(
+                                        arm.pos,
+                                        format!("`{other}` is not a Maybe constructor (expected `none` or `some x`)"),
+                                    ))
+                                }
+                            }
+                        }
+                        if !seen_none {
+                            return Err(ZuError::at(*pos, "`case` is missing the `none` arm"));
+                        }
+                        if !seen_some {
+                            return Err(ZuError::at(*pos, "`case` is missing the `some` arm"));
+                        }
+                    }
+                    Ty::Enum(e) => {
+                        let variants = self.enums[e].clone();
+                        let mut covered = BTreeSet::new();
+                        for arm in arms {
+                            let Some((_, payload)) =
+                                variants.iter().find(|(v, _)| *v == arm.ctor)
+                            else {
+                                return Err(ZuError::at(
+                                    arm.pos,
+                                    format!("`{}` is not a variant of {e}", arm.ctor),
+                                ));
+                            };
+                            if !covered.insert(arm.ctor.clone()) {
+                                return Err(ZuError::at(
+                                    arm.pos,
+                                    format!("duplicate `{}` arm", arm.ctor),
+                                ));
+                            }
+                            match (payload, &arm.binder) {
+                                (Some(t), Some(_)) => check_body(self, arm, Some(t.clone()))?,
+                                (Some(t), None) => {
+                                    return Err(ZuError::at(
+                                        arm.pos,
+                                        format!("`{}` carries a {t} — bind it: `{} x ->`", arm.ctor, arm.ctor),
+                                    ))
+                                }
+                                (None, Some(_)) => {
+                                    return Err(ZuError::at(
+                                        arm.pos,
+                                        format!("`{}` takes no binder", arm.ctor),
+                                    ))
+                                }
+                                (None, None) => check_body(self, arm, None)?,
+                            }
+                        }
+                        for (v, _) in &variants {
+                            if !covered.contains(v) {
+                                return Err(ZuError::at(
+                                    *pos,
+                                    format!("`case` is missing variant `{v}` of {e} — every variant must be handled"),
+                                ));
+                            }
+                        }
+                    }
+                    other => {
+                        return Err(ZuError::at(
+                            *pos,
+                            format!("`case` scrutinee must be a Maybe or an enum, got {other}"),
+                        ))
+                    }
                 }
-                Ok(none_ty)
+                Ok(body_ty.expect("case has at least one arm"))
             }
             Expr::Reverse(inner, pos) => match self.infer(inner, None, env)? {
                 Ty::List(t) => Ok(Ty::List(t)),
@@ -574,10 +787,15 @@ impl Checker {
                         format!("`==`/`!=` compare equal types, got {lt} and {rt}"),
                     ));
                 }
-                if matches!(lt, Ty::Record(_) | Ty::List(_)) {
+                let comparable = match &lt {
+                    Ty::Int | Ty::Str | Ty::Bool => true,
+                    Ty::Enum(e) => self.enum_is_plain(e),
+                    _ => false,
+                };
+                if !comparable {
                     return Err(ZuError::at(
                         pos,
-                        format!("`==`/`!=` only compare Int/String/Bool, got {lt}"),
+                        format!("`==`/`!=` only compare Int/String/Bool/plain enums, got {lt}"),
                     ));
                 }
                 Ok(Ty::Bool)
@@ -673,7 +891,7 @@ fn check_ty_refs(ty: &Ty, names: &BTreeSet<String>, pos: Pos) -> Result<(), ZuEr
     match ty {
         Ty::List(t) | Ty::Maybe(t) => check_ty_refs(t, names, pos),
         Ty::Record(n) if !names.contains(n) => Err(ZuError::at(pos, format!("unknown type `{n}`"))),
-        _ => Ok(()),
+        _ => Ok(()), // Enum names were resolved against declarations already
     }
 }
 
@@ -689,6 +907,7 @@ fn pos_of(expr: &Expr) -> Pos {
         | Expr::Head(_, p)
         | Expr::None(p)
         | Expr::Some(_, p)
+        | Expr::Ctor(_, _, p)
         | Expr::Case { pos: p, .. }
         | Expr::Reverse(_, p)
         | Expr::Not(_, p)

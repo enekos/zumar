@@ -19,6 +19,8 @@ pub enum Ty {
     List(Box<Ty>),
     /// `Maybe T` — an optional, backed by Rust `Option<T>`.
     Maybe(Box<Ty>),
+    /// A user-declared sum type (`enum Status = Todo | Doing | Done`).
+    Enum(String),
     /// A named record — either a `record` declaration or the reserved
     /// `Model` synthesized from the `model {}` block.
     Record(String),
@@ -32,6 +34,7 @@ impl std::fmt::Display for Ty {
             Ty::Bool => f.write_str("Bool"),
             Ty::List(t) => write!(f, "List {t}"),
             Ty::Maybe(t) => write!(f, "Maybe {t}"),
+            Ty::Enum(n) => f.write_str(n),
             Ty::Record(n) => f.write_str(n),
         }
     }
@@ -62,12 +65,14 @@ pub enum Expr {
     None(Pos),
     /// `some(<T>)` -> Maybe T
     Some(Box<Expr>, Pos),
-    /// `case scrut of none -> e | some x -> e` — total: both arms required.
+    /// `Variant(arg)` — an enum constructor with a payload. Bare variants
+    /// parse as `Var` and resolve during checking.
+    Ctor(String, Box<Expr>, Pos),
+    /// `case scrut of <ctor> [binder] -> e | ...` — total: a Maybe needs
+    /// both `none` and `some x`; an enum needs every variant.
     Case {
         scrut: Box<Expr>,
-        none_arm: Box<Expr>,
-        some_var: String,
-        some_arm: Box<Expr>,
+        arms: Vec<CaseArm>,
         pos: Pos,
     },
     /// `reverse(<List T>)` -> List T
@@ -191,6 +196,24 @@ pub struct Element {
     pub children: Vec<Child>,
 }
 
+/// One arm of a `case`: constructor, optional payload binder, body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaseArm {
+    pub ctor: String,
+    pub binder: Option<String>,
+    pub body: Expr,
+    pub pos: Pos,
+}
+
+/// `enum Name = A | B <ty> | C` — variants share one global constructor
+/// namespace (Elm-style), each carrying at most one payload.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDef {
+    pub name: String,
+    pub variants: Vec<(String, Option<Ty>, Pos)>,
+    pub pos: Pos,
+}
+
 /// A `{ field = expr, ... }` record body (used by `init` and `update`).
 pub type Record = Vec<(String, Expr, Pos)>;
 
@@ -223,6 +246,7 @@ pub struct Update {
 pub struct App {
     pub name: String,
     pub records: Vec<RecordDef>,
+    pub enums: Vec<EnumDef>,
     pub model: Vec<(String, Ty, Pos)>,
     pub init: Record,
     /// Commands fired right after the first render (`init = {...} then cmd`).

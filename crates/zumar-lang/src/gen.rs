@@ -53,6 +53,9 @@ type Env = Vec<(String, Ty)>;
 
 struct Gen {
     records: BTreeMap<String, Vec<(String, Ty)>>,
+    enums: BTreeMap<String, Vec<(String, Option<Ty>)>>,
+    /// Constructor -> owning enum.
+    variant_owner: BTreeMap<String, String>,
     next: Cell<usize>,
 }
 
@@ -75,8 +78,24 @@ impl Gen {
                 .map(|(n, t, _)| (n.clone(), t.clone()))
                 .collect(),
         );
+        let mut enums = BTreeMap::new();
+        let mut variant_owner = BTreeMap::new();
+        for e in &app.enums {
+            for (v, _, _) in &e.variants {
+                variant_owner.insert(v.clone(), e.name.clone());
+            }
+            enums.insert(
+                e.name.clone(),
+                e.variants
+                    .iter()
+                    .map(|(v, p, _)| (v.clone(), p.clone()))
+                    .collect(),
+            );
+        }
         Gen {
             records,
+            enums,
+            variant_owner,
             next: Cell::new(0),
         }
     }
@@ -110,6 +129,20 @@ impl Gen {
             o.push_str(" {\n");
             for (n, t, _) in &r.fields {
                 o.push_str(&format!("    pub {n}: {},\n", rust_ty(t)));
+            }
+            o.push_str("}\n\n");
+        }
+
+        // Enums.
+        for e in &app.enums {
+            o.push_str("#[derive(Clone, PartialEq)]\npub enum ");
+            o.push_str(&e.name);
+            o.push_str(" {\n");
+            for (v, payload, _) in &e.variants {
+                match payload {
+                    Some(t) => o.push_str(&format!("    {v}({}),\n", rust_ty(t))),
+                    None => o.push_str(&format!("    {v},\n")),
+                }
             }
             o.push_str("}\n\n");
         }
@@ -439,8 +472,22 @@ impl Gen {
             Expr::Bool(b) => (format!("{b}"), Ty::Bool),
             Expr::Str(s) => (format!("\"{}\".to_string()", esc(s)), Ty::Str),
             Expr::Var(name, _) => {
-                let ty = self.lookup(name, env);
-                (clone_if_owned(name, &ty), ty)
+                if let Some((_, t)) = env.iter().rev().find(|(n, _)| n == name) {
+                    let ty = t.clone();
+                    return (clone_if_owned(name, &ty), ty);
+                }
+                let owner = self.variant_owner[name].clone();
+                (format!("{owner}::{name}"), Ty::Enum(owner))
+            }
+            Expr::Ctor(name, arg, _) => {
+                let owner = self.variant_owner[name].clone();
+                let payload = self.enums[&owner]
+                    .iter()
+                    .find(|(v, _)| v == name)
+                    .and_then(|(_, p)| p.clone())
+                    .expect("typechecked: ctor has payload");
+                let (code, _) = self.emit(arg, Some(&payload), env);
+                (format!("{owner}::{name}({code})"), Ty::Enum(owner))
             }
             Expr::Field(base, field, _) => {
                 let (place, bty) = self.emit_place(base, env);
@@ -504,28 +551,42 @@ impl Gen {
                 let (code, ty) = self.emit(inner, hint.as_ref(), env);
                 (format!("Some({code})"), Ty::Maybe(Box::new(ty)))
             }
-            Expr::Case {
-                scrut,
-                none_arm,
-                some_var,
-                some_arm,
-                ..
-            } => {
+            Expr::Case { scrut, arms, .. } => {
                 let (sc, scrut_ty) = self.emit(scrut, None, env);
-                let inner = match scrut_ty {
-                    Ty::Maybe(t) => *t,
-                    _ => unreachable!("typechecked: maybe"),
-                };
-                let (nc, ty) = self.emit(none_arm, expected, env);
-                let mut some_env = env.clone();
-                some_env.push((some_var.clone(), inner));
-                let (some_c, _) = self.emit(some_arm, expected, &some_env);
-                (
-                    format!(
-                        "(match {sc} {{ None => {{ {nc} }} Some({some_var}) => {{ {some_c} }} }})"
-                    ),
-                    ty,
-                )
+                let mut parts = Vec::new();
+                let mut body_ty = Ty::Int;
+                for arm in arms {
+                    let (pattern, arm_env) = match &scrut_ty {
+                        Ty::Maybe(inner) => match arm.ctor.as_str() {
+                            "none" => ("None".to_string(), env.clone()),
+                            _ => {
+                                let b = arm.binder.clone().unwrap();
+                                let mut e = env.clone();
+                                e.push((b.clone(), inner.as_ref().clone()));
+                                (format!("Some({b})"), e)
+                            }
+                        },
+                        Ty::Enum(en) => {
+                            let payload = self.enums[en]
+                                .iter()
+                                .find(|(v, _)| *v == arm.ctor)
+                                .and_then(|(_, p)| p.clone());
+                            match (&arm.binder, payload) {
+                                (Some(b), Some(pt)) => {
+                                    let mut e = env.clone();
+                                    e.push((b.clone(), pt));
+                                    (format!("{en}::{}({b})", arm.ctor), e)
+                                }
+                                _ => (format!("{en}::{}", arm.ctor), env.clone()),
+                            }
+                        }
+                        _ => unreachable!("typechecked: case scrutinee"),
+                    };
+                    let (body, ty) = self.emit(&arm.body, expected, &arm_env);
+                    body_ty = ty;
+                    parts.push(format!("{pattern} => {{ {body} }}"));
+                }
+                (format!("(match {sc} {{ {} }})", parts.join(" ")), body_ty)
             }
             Expr::Reverse(inner, _) => {
                 let (code, ty) = self.emit(inner, expected, env);
@@ -738,7 +799,10 @@ impl Gen {
             Expr::Int(_) => Ty::Int,
             Expr::Str(_) => Ty::Str,
             Expr::Bool(_) => Ty::Bool,
-            Expr::Var(name, _) => self.lookup(name, env),
+            Expr::Var(name, _) => match env.iter().rev().find(|(n, _)| n == name) {
+                Some((_, t)) => t.clone(),
+                None => Ty::Enum(self.variant_owner[name].clone()),
+            },
             Expr::Field(base, field, _) => match self.type_of(base, env) {
                 Ty::Record(r) => self.field_ty(&r, field),
                 _ => unreachable!(),
@@ -755,7 +819,8 @@ impl Gen {
             },
             Expr::None(_) => Ty::Maybe(Box::new(Ty::Int)),
             Expr::Some(inner, _) => Ty::Maybe(Box::new(self.type_of(inner, env))),
-            Expr::Case { none_arm, .. } => self.type_of(none_arm, env),
+            Expr::Case { arms, .. } => self.type_of(&arms[0].body, env),
+            Expr::Ctor(name, _, _) => Ty::Enum(self.variant_owner[name].clone()),
             Expr::Reverse(inner, _) => self.type_of(inner, env),
             Expr::Not(..) => Ty::Bool,
             Expr::Bin(op, l, _, _) => match op {
@@ -795,6 +860,7 @@ fn rust_ty(ty: &Ty) -> String {
         Ty::Bool => "bool".into(),
         Ty::List(t) => format!("Vec<{}>", rust_ty(t)),
         Ty::Maybe(t) => format!("Option<{}>", rust_ty(t)),
+        Ty::Enum(n) => n.clone(),
         Ty::Record(n) => n.clone(),
     }
 }

@@ -1,0 +1,69 @@
+# kanban.zu — user-defined sum types + general pattern matching.
+# A `case` must handle every variant of Status and View — dropping one is a
+# compile error. Payload-less enums run on BOTH backends (i32 tags on GC).
+
+app Kanban
+
+enum Status = Todo | Doing | Done
+enum View = All | Active | Finished
+
+record Task { id: Int, name: String, status: Status }
+
+model { draft: String, tasks: List Task, seq: Int, filter: View }
+
+init = { draft = "", tasks = [], seq = 1, filter = All }
+
+msg Draft String | Add | Advance Int | ShowAll | ShowActive | ShowFinished
+
+update Draft s = { draft = s }
+
+update Add = {
+  tasks = model.tasks ++ [{ id = model.seq, name = model.draft, status = Todo }],
+  seq = model.seq + 1,
+  draft = ""
+}
+
+# Click a task to advance it around the board: Todo -> Doing -> Done -> Todo.
+update Advance id = {
+  tasks = for t in model.tasks yield
+    (if t.id == id
+     then { t | status = case t.status of Todo -> Doing | Doing -> Done | Done -> Todo }
+     else t)
+}
+
+update ShowAll = { filter = All }
+update ShowActive = { filter = Active }
+update ShowFinished = { filter = Finished }
+
+view =
+  div [class "kanban"] [
+    h1 [] [ text "kanban.zu" ],
+    p [class "sub"] [ text "sum types + total case, on both backends" ],
+    form [onSubmit Add] [
+      input [type "text", placeholder "a task", value model.draft, onInput Draft] [],
+      button [type "submit"] [ text "add" ]
+    ],
+    div [class "counts"] [
+      text ("todo " ++ show(length(for t in model.tasks where t.status == Todo yield t))
+        ++ " / doing " ++ show(length(for t in model.tasks where t.status == Doing yield t))
+        ++ " / done " ++ show(length(for t in model.tasks where t.status == Done yield t)))
+    ],
+    div [class "filters"] [
+      button [class (if model.filter == All then "on" else ""), onClick ShowAll] [ text "all" ],
+      button [class (if model.filter == Active then "on" else ""), onClick ShowActive] [ text "active" ],
+      button [class (if model.filter == Finished then "on" else ""), onClick ShowFinished] [ text "finished" ]
+    ],
+    ul [class "tasks"] [
+      for t in (for t in model.tasks
+                where (case model.filter of
+                        All -> true
+                        | Active -> not (t.status == Done)
+                        | Finished -> t.status == Done)
+                yield t) {
+        li [class (case t.status of Todo -> "todo" | Doing -> "doing" | Done -> "done")] [
+          span [class "glyph"] [ text (case t.status of Todo -> "[ ]" | Doing -> "[~]" | Done -> "[x]") ],
+          span [class "name", onClick Advance(t.id)] [ text t.name ]
+        ]
+      }
+    ]
+  ]

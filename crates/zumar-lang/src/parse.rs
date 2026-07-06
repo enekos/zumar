@@ -3,6 +3,7 @@
 //! ```text
 //! program := "app" IDENT decl*
 //! decl    := "record" IDENT "{" (IDENT ":" ty),* "}"
+//!          | "enum" IDENT "=" variant ("|" variant)*   ; variant := IDENT ty?
 //!          | "model" "{" (IDENT ":" ty),* "}"
 //!          | "init" "=" record cmds?
 //!          | "msg" msgitem ("|" msgitem)*
@@ -24,9 +25,9 @@
 //! child   := "text" expr | "for" IDENT "in" expr "{" element "}" | element
 //! expr    := "if" expr "then" expr "else" expr
 //!          | "for" IDENT "in" expr ("where" expr)? "yield" expr
-//!          | "case" expr "of" arm "|" arm     (one none, one some x)
+//!          | "case" expr "of" arm ("|" arm)*   (total: all ctors covered)
 //!          | cmp
-//! arm     := "none" "->" expr | "some" IDENT "->" expr
+//! arm     := IDENT IDENT? "->" expr
 //! cmp     := add (("=="|"!="|"<"|">") add)?
 //! add     := mul (("+"|"-"|"++") mul)*
 //! mul     := unary (("*"|"/"|"%") unary)*
@@ -45,7 +46,7 @@ use crate::lex::{lex, Tok, Token};
 /// payload type — lets `msg Reverse` followed by `update ...` parse without
 /// mistaking `update` for Reverse's payload.
 const KEYWORDS: &[&str] = &[
-    "app", "record", "model", "init", "msg", "update", "sub", "view",
+    "app", "record", "enum", "model", "init", "msg", "update", "sub", "view",
 ];
 
 pub fn parse(src: &str) -> Result<App, ZuError> {
@@ -145,6 +146,7 @@ impl Parser {
         let (name, _) = self.ident("app name")?;
 
         let mut records = Vec::new();
+        let mut enums = Vec::new();
         let mut model = None;
         let mut init = None;
         let mut init_cmds = Vec::new();
@@ -161,6 +163,21 @@ impl Parser {
                     "record" => {
                         self.next();
                         records.push(self.record_decl()?);
+                    }
+                    "enum" => {
+                        self.next();
+                        let (name, pos) = self.ident("enum name")?;
+                        self.expect(Tok::Eq)?;
+                        let mut variants = vec![self.variant()?];
+                        while self.peek().tok == Tok::Pipe {
+                            self.next();
+                            variants.push(self.variant()?);
+                        }
+                        enums.push(EnumDef {
+                            name,
+                            variants,
+                            pos,
+                        });
                     }
                     "model" => {
                         self.next();
@@ -216,7 +233,7 @@ impl Parser {
                     }
                     other => {
                         let msg = format!(
-                            "expected a declaration (record/model/init/msg/update/sub/view), found `{other}`"
+                            "expected a declaration (record/enum/model/init/msg/update/sub/view), found `{other}`"
                         );
                         return Err(ZuError::at(t.pos, msg));
                     }
@@ -234,6 +251,7 @@ impl Parser {
         Ok(App {
             name,
             records,
+            enums,
             model: model.ok_or_else(|| missing("model"))?,
             init: init.ok_or_else(|| missing("init"))?,
             init_cmds,
@@ -291,6 +309,15 @@ impl Parser {
             msgs.push(self.msg_item()?);
         }
         Ok(msgs)
+    }
+
+    fn variant(&mut self) -> Result<(String, Option<Ty>, Pos), ZuError> {
+        let (name, pos) = self.ident("variant name")?;
+        let payload = match &self.peek().tok {
+            Tok::Ident(s) if !KEYWORDS.contains(&s.as_str()) => Some(self.ty()?),
+            _ => None,
+        };
+        Ok((name, payload, pos))
     }
 
     fn msg_item(&mut self) -> Result<MsgDef, ZuError> {
@@ -614,36 +641,33 @@ impl Parser {
                 "expected `of` after the `case` scrutinee",
             ));
         }
-        let mut none_arm = None;
-        let mut some = None;
-        for i in 0..2 {
-            if i == 1 {
-                self.expect(Tok::Pipe)?;
-            }
-            if self.eat_ident("none") {
-                self.expect(Tok::Arrow)?;
-                if none_arm.replace(self.expr()?).is_some() {
-                    return Err(ZuError::at(pos, "duplicate `none` arm"));
-                }
-            } else if self.eat_ident("some") {
-                let (var, _) = self.ident("variable after `some`")?;
-                self.expect(Tok::Arrow)?;
-                if some.replace((var, self.expr()?)).is_some() {
-                    return Err(ZuError::at(pos, "duplicate `some` arm"));
-                }
-            } else {
-                return Err(ZuError::at(self.peek().pos, "expected `none` or `some x`"));
-            }
+        let mut arms = vec![self.case_arm()?];
+        while self.peek().tok == Tok::Pipe {
+            self.next();
+            arms.push(self.case_arm()?);
         }
-        let none_arm =
-            none_arm.ok_or_else(|| ZuError::at(pos, "`case` is missing the `none` arm"))?;
-        let (some_var, some_arm) =
-            some.ok_or_else(|| ZuError::at(pos, "`case` is missing the `some` arm"))?;
         Ok(Expr::Case {
             scrut: Box::new(scrut),
-            none_arm: Box::new(none_arm),
-            some_var,
-            some_arm: Box::new(some_arm),
+            arms,
+            pos,
+        })
+    }
+
+    /// `<ctor> [binder] -> expr` — `none ->`, `some x ->`, or an enum
+    /// variant (with a binder when the variant carries a payload).
+    fn case_arm(&mut self) -> Result<CaseArm, ZuError> {
+        let (ctor, pos) = self.ident("a constructor (`none`, `some x`, or an enum variant)")?;
+        let binder = if matches!(self.peek().tok, Tok::Ident(_)) {
+            Some(self.ident("payload binder")?.0)
+        } else {
+            None
+        };
+        self.expect(Tok::Arrow)?;
+        let body = self.expr()?;
+        Ok(CaseArm {
+            ctor,
+            binder,
+            body,
             pos,
         })
     }
@@ -770,7 +794,16 @@ impl Parser {
                         t.pos,
                     ))
                 }
-                _ => Ok(Expr::Var(s, t.pos)),
+                _ => {
+                    if self.peek().tok == Tok::LParen {
+                        self.next();
+                        let arg = self.expr()?;
+                        self.expect(Tok::RParen)?;
+                        Ok(Expr::Ctor(s, Box::new(arg), t.pos))
+                    } else {
+                        Ok(Expr::Var(s, t.pos))
+                    }
+                }
             },
             other => Err(ZuError::at(
                 t.pos,

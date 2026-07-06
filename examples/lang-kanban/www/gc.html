@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>kanban.zu — sum types on the WasmGC backend</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0; min-height: 100vh; display: grid; place-items: start center;
+      background: #12140f; color: #e8e6d9;
+      font-family: ui-monospace, "SF Mono", Menlo, monospace; padding-top: 8vh;
+    }
+    .kanban { width: min(30rem, 92vw); }
+    .kanban h1 { font-size: 1.8rem; letter-spacing: 0.2em; color: #d96a8f; margin-bottom: 0.1rem; }
+    .sub { color: #6f7362; font-size: 0.78rem; margin-top: 0; }
+    form { display: flex; gap: 0.5rem; margin: 0.8rem 0 0.5rem; }
+    input[type="text"] {
+      flex: 1; background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.5rem 0.8rem;
+    }
+    input[type="text"]:focus { outline: none; border-color: #d96a8f; }
+    button {
+      background: #1e2318; color: #e8e6d9; border: 1px solid #3a4230;
+      border-radius: 8px; font: inherit; padding: 0.45rem 0.9rem; cursor: pointer;
+    }
+    button:hover { border-color: #d96a8f; }
+    .counts { color: #6f7362; font-size: 0.8rem; margin: 0.4rem 0; }
+    .filters { display: flex; gap: 0.5rem; margin-bottom: 0.6rem; }
+    .filters button { font-size: 0.75rem; padding: 0.25rem 0.7rem; color: #6f7362; }
+    .filters button.on { color: #d96a8f; border-color: #d96a8f; }
+    ul.tasks { list-style: none; padding: 0; margin: 0; }
+    ul.tasks li { display: flex; align-items: center; gap: 0.7rem;
+                  padding: 0.45rem 0.2rem; border-bottom: 1px solid #1e2318; }
+    ul.tasks li .glyph { font-variant-numeric: tabular-nums; }
+    ul.tasks li .name { cursor: pointer; }
+    ul.tasks li.todo .glyph { color: #6f7362; }
+    ul.tasks li.doing .glyph { color: #d9c86a; }
+    ul.tasks li.done .glyph { color: #9db668; }
+    ul.tasks li.done .name { text-decoration: line-through; color: #6f7362; }
+  </style>
+</head>
+<body>
+  <div id="app"></div>
+  <script type="module">
+    import { mount } from "./zumar.js";
+    import { gcApp } from "./zumar-gc.js";
+    const { instance } = await WebAssembly.instantiateStreaming(fetch("./pkg/kanban-gc.wasm"), {});
+    mount(gcApp(instance.exports), document.getElementById("app"));
+  </script>
+</body>
+</html>

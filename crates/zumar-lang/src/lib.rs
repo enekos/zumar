@@ -19,10 +19,10 @@ pub mod parse;
 pub use ast::{App, ZuError};
 pub use gen::Generated;
 
-/// Parse + typecheck.
+/// Parse + typecheck (resolving named types to records/enums).
 pub fn compile(source: &str) -> Result<App, ZuError> {
-    let app = parse::parse(source)?;
-    check::check(&app)?;
+    let mut app = parse::parse(source)?;
+    check::check(&mut app)?;
     Ok(app)
 }
 
@@ -498,6 +498,135 @@ view = div [] [ text show(model.n) ]
         let rs = gen_rs(src);
         assert!(rs.contains("checked_div"), "{rs}");
         assert!(rs.contains("checked_rem"), "{rs}");
+    }
+
+    const KANBAN: &str = r#"
+app Kanban
+enum Status = Todo | Doing | Done
+record Task { id: Int, name: String, status: Status }
+model { draft: String, tasks: List Task, seq: Int }
+init = { draft = "", tasks = [], seq = 1 }
+msg Draft String | Add | Advance Int
+update Draft s = { draft = s }
+update Add = {
+  tasks = model.tasks ++ [{ id = model.seq, name = model.draft, status = Todo }],
+  seq = model.seq + 1, draft = ""
+}
+update Advance id = {
+  tasks = for t in model.tasks yield
+    (if t.id == id
+     then { t | status = case t.status of Todo -> Doing | Doing -> Done | Done -> Todo }
+     else t)
+}
+view =
+  div [] [
+    span [] [ text show(length(for t in model.tasks where t.status == Doing yield t)) ],
+    ul [] [
+      for t in model.tasks {
+        li [class (case t.status of Todo -> "todo" | Doing -> "doing" | Done -> "done")] [
+          span [onClick Advance(t.id)] [ text t.name ]
+        ]
+      }
+    ]
+  ]
+"#;
+
+    #[test]
+    fn enums_compile_and_lower_to_rust_enums() {
+        let rs = gen_rs(KANBAN);
+        for needle in [
+            "#[derive(Clone, PartialEq)]\npub enum Status {",
+            "    Todo,\n    Doing,\n    Done,",
+            "status: Status,",
+            "status: Status::Todo",
+            "match t.status.clone() { Status::Todo => { Status::Doing } Status::Doing => { Status::Done } Status::Done => { Status::Todo } }",
+            "(t.status.clone() == Status::Doing)",
+        ] {
+            assert!(rs.contains(needle), "missing {needle:?} in:\n{rs}");
+        }
+    }
+
+    #[test]
+    fn case_over_enum_must_cover_every_variant() {
+        let src = KANBAN.replace("| Done -> Todo }", "}");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("missing variant `Done`"), "{err}");
+    }
+
+    #[test]
+    fn unknown_variant_in_case_is_an_error() {
+        let src = KANBAN.replace("Todo -> Doing |", "Blocked -> Doing |");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("not a variant of Status"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_case_arm_is_an_error() {
+        let src = KANBAN.replace("Doing -> Done |", "Todo -> Done |");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("duplicate `Todo` arm"), "{err}");
+    }
+
+    #[test]
+    fn enum_payload_variants_bind_in_case() {
+        let src = r#"
+app P
+enum Filter = All | ByOwner String
+model { f: Filter, who: String }
+init = { f = All, who = "" }
+msg Set String
+update Set s = { f = ByOwner(s), who = case ByOwner(s) of All -> "" | ByOwner o -> o }
+view = div [] [ text model.who ]
+"#;
+        let rs = gen_rs(src);
+        assert!(rs.contains("ByOwner(String),"), "{rs}");
+        assert!(rs.contains("Filter::ByOwner(o) => { o.clone() }"), "{rs}");
+    }
+
+    #[test]
+    fn payload_variant_needs_binder() {
+        let src = r#"
+app P
+enum F = A | B Int
+model { n: Int }
+init = { n = 0 }
+msg M
+update M = { n = case B(1) of A -> 0 | B -> 1 }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("bind it"), "{err}");
+    }
+
+    #[test]
+    fn eq_on_payload_enum_is_an_error() {
+        let src = r#"
+app P
+enum F = A | B Int
+model { f: F, ok: Bool }
+init = { f = A, ok = false }
+msg M
+update M = { ok = model.f == A }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("plain enums"), "{err}");
+    }
+
+    #[test]
+    fn variant_names_share_one_namespace() {
+        let src = r#"
+app P
+enum A = X | Y
+enum B = Y | Z
+model { n: Int }
+init = { n = 0 }
+msg M
+update M = { n = 0 }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("already declared"), "{err}");
     }
 
     #[test]

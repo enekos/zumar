@@ -123,10 +123,30 @@ message, or passes the clock when the message takes an Int. Arithmetic
 includes `/` and `%`, with division by zero yielding 0, Elm's rule. See
 `examples/lang-clock`.
 
+Sum types are declared with `enum`; `case` works over them and must handle
+every variant — dropping one is a compile error, the same totality rule as
+messages and `Maybe`:
+
+```
+enum Status = Todo | Doing | Done
+
+update Advance id = {
+  tasks = for t in model.tasks yield
+    (if t.id == id
+     then { t | status = case t.status of Todo -> Doing | Doing -> Done | Done -> Todo }
+     else t)
+}
+```
+
+Variants may carry one payload (`enum Filter = All | ByOwner String`),
+bound in the arm (`ByOwner o -> ...`); constructors share one namespace.
+Payload-less enums compare with `==` and run on both backends (i32 tags on
+GC) — see `examples/lang-kanban`.
+
 ### Not there yet
 
-No *user-defined* sum types or general pattern matching (only the built-in
-`Maybe`/`case`), and no `fold`/lambdas.
+Enum payload variants don't reach the GC backend yet, and there are no
+`fold`/lambdas.
 
 ## The protocol
 
@@ -168,8 +188,8 @@ verbatim.
   interval, fetches, and delay chain is 2.7 KB. Not yet there: `Maybe`,
   Bool payloads, nested `for`.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
-  and lang-counter / lang-todo / lang-expenses / lang-queue / lang-clock
-  (compiled from `.zu`).
+  and lang-counter / lang-todo / lang-expenses / lang-queue / lang-clock /
+  lang-kanban (compiled from `.zu`).
 - `spikes/wasmgc` — findings + harnesses for the GC backend.
 
 ## Numbers
@@ -218,7 +238,9 @@ python3 -m http.server 8765 -d www
    hello, and todo all run on it~~
 8. ~~effects in the language: `then` commands, `sub` subscriptions, `/`
    and `%` (`clock.zu`)~~ + ~~effects on the GC backend~~
-9. next: user-defined sum types + general pattern matching; GC gaps
-   (`Maybe`, Bool payloads, nested `for`).
+9. ~~user-defined sum types + general pattern matching (`kanban.zu`, both
+   backends)~~
+10. next: `fold`/lambdas; GC gaps (`Maybe`, enum payloads, Bool payloads,
+    nested `for`).
 
 MIT.

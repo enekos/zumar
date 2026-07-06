@@ -250,6 +250,8 @@ struct Emitter<'a> {
     events: BTreeMap<String, bool>,
     /// Temp locals allocated while emitting the init tree.
     init_ctx_locals: Vec<ValType>,
+    /// Constructor -> (owning enum, i32 tag). GC enums are payload-less.
+    enum_tags: BTreeMap<String, (String, u32)>,
     cmd_sites: Vec<CmdSite>,
     /// Callsite indices staged by `init` and by each update arm.
     init_sites: Vec<usize>,
@@ -262,7 +264,7 @@ impl<'a> Emitter<'a> {
         let mut records = Vec::new();
         for r in &app.records {
             for (name, ty, pos) in &r.fields {
-                if !matches!(ty, Ty::Int | Ty::Str | Ty::Bool) {
+                if !matches!(ty, Ty::Int | Ty::Str | Ty::Bool | Ty::Enum(_)) {
                     return Err(unsupported(*pos, &format!("record field `{name}: {ty}`")));
                 }
             }
@@ -276,7 +278,7 @@ impl<'a> Emitter<'a> {
         }
         for (name, ty, pos) in &app.model {
             match ty {
-                Ty::Int | Ty::Str | Ty::Bool => {}
+                Ty::Int | Ty::Str | Ty::Bool | Ty::Enum(_) => {}
                 Ty::List(inner) if matches!(inner.as_ref(), Ty::Record(_)) => {}
                 _ => return Err(unsupported(*pos, &format!("model field `{name}: {ty}`"))),
             }
@@ -290,6 +292,14 @@ impl<'a> Emitter<'a> {
             }
         }
 
+        for en in &app.enums {
+            for (v, payload, pos) in &en.variants {
+                let _ = v;
+                if payload.is_some() {
+                    return Err(unsupported(*pos, "enum variants with payloads"));
+                }
+            }
+        }
         let mut e = Emitter {
             app,
             records,
@@ -310,11 +320,17 @@ impl<'a> Emitter<'a> {
             handlers: Vec::new(),
             events: BTreeMap::new(),
             init_ctx_locals: Vec::new(),
+            enum_tags: BTreeMap::new(),
             cmd_sites: Vec::new(),
             init_sites: Vec::new(),
             update_sites: Vec::new(),
             sub_sites: Vec::new(),
         };
+        for en in &app.enums {
+            for (tag, (v, _, _)) in en.variants.iter().enumerate() {
+                e.enum_tags.insert(v.clone(), (en.name.clone(), tag as u32));
+            }
+        }
         // The init tree needs a Ctx for inline dynamic expressions.
         let mut ctx = Ctx::new(0);
         let mut tree = Vec::new();
@@ -569,7 +585,7 @@ impl<'a> Emitter<'a> {
     fn val_type(&self, ty: &Ty) -> ValType {
         match ty {
             Ty::Int => ValType::I64,
-            Ty::Bool => ValType::I32,
+            Ty::Bool | Ty::Enum(_) => ValType::I32,
             Ty::Str => str_val(),
             Ty::Record(r) => ValType::Ref(nullable(self.rec_idx(r))),
             Ty::List(inner) => {
@@ -594,8 +610,15 @@ impl<'a> Emitter<'a> {
                 Some(Slot::PayloadStr) => Ty::Str,
                 Some(Slot::PayloadInt) => Ty::Int,
                 Some(Slot::Item(_, r)) => Ty::Record(r),
-                None => Ty::Int,
+                None => match self.enum_tags.get(v) {
+                    Some((owner, _)) => Ty::Enum(owner.clone()),
+                    None => Ty::Int,
+                },
             },
+            Expr::Case { arms, .. } => arms
+                .first()
+                .map(|a| self.ty_of(&a.body, ctx))
+                .unwrap_or(Ty::Int),
             Expr::Field(base, f, _) => match self.ty_of(base, ctx) {
                 Ty::Record(r) if r == MODEL => self.field_ty(f),
                 Ty::Record(r) => self.record_field_ty(&r, f),
@@ -987,6 +1010,9 @@ impl<'a> Emitter<'a> {
                 self.int_expr(f, ctx, out)?;
                 out.push(I::End);
             }
+            Expr::Case { scrut, arms, .. } => {
+                self.case_expr_gc(scrut, arms, &Ty::Int, ctx, out)?;
+            }
             other => return Err(unsupported(pos_of(other), "this expression")),
         }
         Ok(())
@@ -1031,6 +1057,9 @@ impl<'a> Emitter<'a> {
                 self.str_expr(f, ctx, out)?;
                 out.push(I::End);
             }
+            Expr::Case { scrut, arms, .. } => {
+                self.case_expr_gc(scrut, arms, &Ty::Str, ctx, out)?;
+            }
             other => return Err(unsupported(pos_of(other), "this text expression")),
         }
         Ok(())
@@ -1051,13 +1080,18 @@ impl<'a> Emitter<'a> {
             }
             Expr::Field(..) => self.place(e, ctx, out)?, // Bool struct field (i32)
             Expr::Bin(op @ (Op::Eq | Op::Ne), l, r, _) => {
-                if self.ty_of(l, ctx) == Ty::Str {
+                let lt = self.ty_of(l, ctx);
+                if lt == Ty::Str {
                     self.str_expr(l, ctx, out)?;
                     self.str_expr(r, ctx, out)?;
                     out.push(I::Call(F_STREQ));
                     if *op == Op::Ne {
                         out.push(I::I32Eqz);
                     }
+                } else if matches!(lt, Ty::Enum(_)) {
+                    self.enum_expr(l, ctx, out)?;
+                    self.enum_expr(r, ctx, out)?;
+                    out.push(if *op == Op::Eq { I::I32Eq } else { I::I32Ne });
                 } else {
                     self.int_expr(l, ctx, out)?;
                     self.int_expr(r, ctx, out)?;
@@ -1068,6 +1102,9 @@ impl<'a> Emitter<'a> {
                 self.int_expr(l, ctx, out)?;
                 self.int_expr(r, ctx, out)?;
                 out.push(if *op == Op::Lt { I::I64LtS } else { I::I64GtS });
+            }
+            Expr::Case { scrut, arms, .. } => {
+                self.case_expr_gc(scrut, arms, &Ty::Bool, ctx, out)?;
             }
             other => return Err(unsupported(pos_of(other), "this condition")),
         }
@@ -1159,6 +1196,9 @@ impl<'a> Emitter<'a> {
                 self.rec_expr(f, rec, ctx, out)?;
                 out.push(I::End);
             }
+            Expr::Case { scrut, arms, .. } => {
+                self.case_expr_gc(scrut, arms, &Ty::Record(rec.to_string()), ctx, out)?;
+            }
             other => return Err(unsupported(pos_of(other), "this record expression")),
         }
         Ok(())
@@ -1234,6 +1274,90 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// Push a payload-less enum value (its i32 tag).
+    fn enum_expr(
+        &mut self,
+        e: &Expr,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        match e {
+            Expr::Var(v, pos) => {
+                if ctx.lookup(v).is_some() {
+                    return Err(unsupported(*pos, &format!("variable `{v}` here")));
+                }
+                match self.enum_tags.get(v) {
+                    Some((_, tag)) => out.push(I::I32Const(*tag as i32)),
+                    None => return Err(unsupported(*pos, &format!("`{v}` here"))),
+                }
+            }
+            Expr::Field(..) => self.place(e, ctx, out)?,
+            Expr::If(c, t, f, _) => {
+                self.bool_expr(c, ctx, out)?;
+                out.push(I::If(BlockType::Result(ValType::I32)));
+                self.enum_expr(t, ctx, out)?;
+                out.push(I::Else);
+                self.enum_expr(f, ctx, out)?;
+                out.push(I::End);
+            }
+            Expr::Case { scrut, arms, .. } => {
+                let ty = self.ty_of(e, ctx);
+                self.case_expr_gc(scrut, arms, &ty, ctx, out)?;
+            }
+            other => return Err(unsupported(pos_of(other), "this enum expression")),
+        }
+        Ok(())
+    }
+
+    /// `case` over a payload-less enum, in any value position: an if-chain
+    /// on the scrutinee's tag, the last arm as the else (the checker
+    /// guarantees coverage).
+    fn case_expr_gc(
+        &mut self,
+        scrut: &Expr,
+        arms: &[zumar_lang::ast::CaseArm],
+        ty: &Ty,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let sty = self.ty_of(scrut, ctx);
+        if !matches!(sty, Ty::Enum(_)) {
+            return Err(unsupported(pos_of(scrut), "`case` over Maybe values"));
+        }
+        let s = ctx.tmp(ValType::I32);
+        self.enum_expr(scrut, ctx, out)?;
+        out.push(I::LocalSet(s));
+        let vt = self.val_type(ty);
+        let ty = ty.clone();
+        self.case_chain(arms, 0, s, vt, &ty, ctx, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn case_chain(
+        &mut self,
+        arms: &[zumar_lang::ast::CaseArm],
+        i: usize,
+        s: u32,
+        vt: ValType,
+        ty: &Ty,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        if i + 1 == arms.len() {
+            return self.val_expr(&arms[i].body, ty, ctx, out);
+        }
+        let (_, tag) = self.enum_tags[&arms[i].ctor].clone();
+        out.push(I::LocalGet(s));
+        out.push(I::I32Const(tag as i32));
+        out.push(I::I32Eq);
+        out.push(I::If(BlockType::Result(vt)));
+        self.val_expr(&arms[i].body, ty, ctx, out)?;
+        out.push(I::Else);
+        self.case_chain(arms, i + 1, s, vt, ty, ctx, out)?;
+        out.push(I::End);
+        Ok(())
+    }
+
     /// A value of the given type (drives update arms, boot, record fields).
     fn val_expr(
         &mut self,
@@ -1246,6 +1370,7 @@ impl<'a> Emitter<'a> {
             Ty::Int => self.int_expr(e, ctx, out),
             Ty::Str => self.str_expr(e, ctx, out),
             Ty::Bool => self.bool_expr(e, ctx, out),
+            Ty::Enum(_) => self.enum_expr(e, ctx, out),
             Ty::Record(r) => self.rec_expr(e, r, ctx, out),
             Ty::List(elem) => {
                 let Ty::Record(rec) = elem.as_ref() else {
@@ -1473,7 +1598,7 @@ impl<'a> Emitter<'a> {
                     .map(|(_, t)| FieldType {
                         element_type: StorageType::Val(match t {
                             Ty::Int => ValType::I64,
-                            Ty::Bool => ValType::I32,
+                            Ty::Bool | Ty::Enum(_) => ValType::I32,
                             _ => str_val(),
                         }),
                         mutable: true,
@@ -2885,6 +3010,7 @@ fn pos_of(e: &Expr) -> Pos {
         | Expr::Head(_, p)
         | Expr::None(p)
         | Expr::Some(_, p)
+        | Expr::Ctor(_, _, p)
         | Expr::Case { pos: p, .. }
         | Expr::Reverse(_, p)
         | Expr::Not(_, p)
