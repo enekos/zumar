@@ -260,6 +260,24 @@ impl<'a> Emitter<'a> {
                 }
             }
         }
+        if let Some(cmd) = app
+            .init_cmds
+            .iter()
+            .chain(app.updates.iter().flat_map(|u| u.cmds.iter()))
+            .next()
+        {
+            let pos = match cmd {
+                zumar_lang::ast::CmdCall::Delay { pos, .. } => *pos,
+                zumar_lang::ast::CmdCall::HttpGet { pos, .. } => *pos,
+            };
+            return Err(unsupported(pos, "effects (`then` commands)"));
+        }
+        if app.subs.is_some() {
+            return Err(unsupported(
+                Pos { line: 1, col: 1 },
+                "effects (`sub` subscriptions)",
+            ));
+        }
         let mut e = Emitter {
             app,
             records,
@@ -481,7 +499,7 @@ impl<'a> Emitter<'a> {
                 _ => Ty::Int,
             },
             Expr::Bin(Op::Concat, l, ..) => self.ty_of(l, ctx),
-            Expr::Bin(Op::Add | Op::Sub | Op::Mul, ..) => Ty::Int,
+            Expr::Bin(Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem, ..) => Ty::Int,
             Expr::Bin(..) => Ty::Bool,
             Expr::If(_, t, ..) => self.ty_of(t, ctx),
             Expr::Reverse(inner, _) => self.ty_of(inner, ctx),
@@ -835,6 +853,28 @@ impl<'a> Emitter<'a> {
                     Op::Sub => I::I64Sub,
                     _ => I::I64Mul,
                 });
+            }
+            // Division/remainder by zero yield 0 (Elm's rule): guard the trap.
+            Expr::Bin(op @ (Op::Div | Op::Rem), l, r, _) => {
+                let a = ctx.tmp(ValType::I64);
+                let b = ctx.tmp(ValType::I64);
+                self.int_expr(l, ctx, out)?;
+                out.push(I::LocalSet(a));
+                self.int_expr(r, ctx, out)?;
+                out.push(I::LocalSet(b));
+                out.push(I::LocalGet(b));
+                out.push(I::I64Eqz);
+                out.push(I::If(BlockType::Result(ValType::I64)));
+                out.push(I::I64Const(0));
+                out.push(I::Else);
+                out.push(I::LocalGet(a));
+                out.push(I::LocalGet(b));
+                out.push(if *op == Op::Div {
+                    I::I64DivS
+                } else {
+                    I::I64RemS
+                });
+                out.push(I::End);
             }
             Expr::If(c, t, f, _) => {
                 self.bool_expr(c, ctx, out)?;
@@ -2464,6 +2504,22 @@ view = div [] []
         let app = zumar_lang::compile(src).unwrap();
         let err = emit(&app).unwrap_err();
         assert!(err.contains("not yet in the wasmgc backend"), "{err}");
+    }
+
+    #[test]
+    fn effects_error_cleanly() {
+        let src = r#"
+app E
+model { n: Int }
+init = { n = 0 }
+msg M | P
+update M = { n = 1 } then delay(100, P)
+update P = { n = 2 }
+view = div [] []
+"#;
+        let app = zumar_lang::compile(src).unwrap();
+        let err = emit(&app).unwrap_err();
+        assert!(err.contains("effects"), "{err}");
     }
 
     #[test]

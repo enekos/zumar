@@ -4,10 +4,15 @@
 //! program := "app" IDENT decl*
 //! decl    := "record" IDENT "{" (IDENT ":" ty),* "}"
 //!          | "model" "{" (IDENT ":" ty),* "}"
-//!          | "init" "=" record
+//!          | "init" "=" record cmds?
 //!          | "msg" msgitem ("|" msgitem)*
-//!          | "update" IDENT IDENT? "=" record
+//!          | "update" IDENT IDENT? "=" record cmds?
+//!          | "sub" "=" subexpr
 //!          | "view" "=" element
+//! cmds    := "then" cmdcall ("," cmdcall)*
+//! cmdcall := "delay" "(" INT "," IDENT ")" | "httpGet" "(" expr "," IDENT ")"
+//! subexpr := "if" expr "then" subexpr "else" subexpr
+//!          | "[" ("every" "(" INT "," IDENT ")"),* "]"
 //! msgitem := IDENT ty?
 //! ty      := "Int" | "String" | "Bool" | "List" ty | "Maybe" ty | IDENT
 //! record  := "{" (IDENT "=" expr),* "}"
@@ -24,7 +29,7 @@
 //! arm     := "none" "->" expr | "some" IDENT "->" expr
 //! cmp     := add (("=="|"!="|"<"|">") add)?
 //! add     := mul (("+"|"-"|"++") mul)*
-//! mul     := unary ("*" unary)*
+//! mul     := unary (("*"|"/"|"%") unary)*
 //! unary   := "not" unary | postfix
 //! postfix := atom ("." IDENT)*
 //! atom    := INT | STRING | "true" | "false" | "none" | IDENT
@@ -39,7 +44,9 @@ use crate::lex::{lex, Tok, Token};
 /// Declaration keywords, which therefore can't be used as a bare message
 /// payload type — lets `msg Reverse` followed by `update ...` parse without
 /// mistaking `update` for Reverse's payload.
-const KEYWORDS: &[&str] = &["app", "record", "model", "init", "msg", "update", "view"];
+const KEYWORDS: &[&str] = &[
+    "app", "record", "model", "init", "msg", "update", "sub", "view",
+];
 
 pub fn parse(src: &str) -> Result<App, ZuError> {
     let toks = lex(src)?;
@@ -140,8 +147,10 @@ impl Parser {
         let mut records = Vec::new();
         let mut model = None;
         let mut init = None;
+        let mut init_cmds = Vec::new();
         let mut msgs = None;
         let mut updates = Vec::new();
+        let mut subs = None;
         let mut view = None;
 
         loop {
@@ -165,6 +174,7 @@ impl Parser {
                         if init.replace(self.record()?).is_some() {
                             return Err(ZuError::at(t.pos, "duplicate `init` declaration"));
                         }
+                        init_cmds = self.cmds()?;
                     }
                     "msg" => {
                         self.next();
@@ -180,12 +190,22 @@ impl Parser {
                             _ => None,
                         };
                         self.expect(Tok::Eq)?;
+                        let fields = self.record()?;
+                        let cmds = self.cmds()?;
                         updates.push(Update {
                             msg,
                             var,
-                            fields: self.record()?,
+                            fields,
+                            cmds,
                             pos,
                         });
+                    }
+                    "sub" => {
+                        self.next();
+                        self.expect(Tok::Eq)?;
+                        if subs.replace(self.sub_expr()?).is_some() {
+                            return Err(ZuError::at(t.pos, "duplicate `sub` declaration"));
+                        }
                     }
                     "view" => {
                         self.next();
@@ -196,7 +216,7 @@ impl Parser {
                     }
                     other => {
                         let msg = format!(
-                            "expected a declaration (record/model/init/msg/update/view), found `{other}`"
+                            "expected a declaration (record/model/init/msg/update/sub/view), found `{other}`"
                         );
                         return Err(ZuError::at(t.pos, msg));
                     }
@@ -216,8 +236,10 @@ impl Parser {
             records,
             model: model.ok_or_else(|| missing("model"))?,
             init: init.ok_or_else(|| missing("init"))?,
+            init_cmds,
             msgs: msgs.ok_or_else(|| missing("msg"))?,
             updates,
+            subs,
             view: view.ok_or_else(|| missing("view"))?,
         })
     }
@@ -306,6 +328,99 @@ impl Parser {
             }
         }
         Ok(fields)
+    }
+
+    /// `then cmd (, cmd)*` after an init/update record — or nothing.
+    fn cmds(&mut self) -> Result<Vec<CmdCall>, ZuError> {
+        if !self.eat_ident("then") {
+            return Ok(Vec::new());
+        }
+        let mut cmds = vec![self.cmd_call()?];
+        while self.peek().tok == Tok::Comma {
+            self.next();
+            cmds.push(self.cmd_call()?);
+        }
+        Ok(cmds)
+    }
+
+    fn cmd_call(&mut self) -> Result<CmdCall, ZuError> {
+        let (name, pos) = self.ident("a command (delay, httpGet)")?;
+        match name.as_str() {
+            "delay" => {
+                self.expect(Tok::LParen)?;
+                let ms = self.int_lit("delay milliseconds")?;
+                self.expect(Tok::Comma)?;
+                let (msg, _) = self.ident("message name")?;
+                self.expect(Tok::RParen)?;
+                Ok(CmdCall::Delay { ms, msg, pos })
+            }
+            "httpGet" => {
+                self.expect(Tok::LParen)?;
+                let url = self.expr()?;
+                self.expect(Tok::Comma)?;
+                let (ctor, _) = self.ident("message constructor")?;
+                self.expect(Tok::RParen)?;
+                Ok(CmdCall::HttpGet { url, ctor, pos })
+            }
+            other => Err(ZuError::at(
+                pos,
+                format!("unknown command `{other}` (available: delay, httpGet)"),
+            )),
+        }
+    }
+
+    /// `sub =` body: a bracket list of `every(...)`, or an if choosing
+    /// between two sub expressions.
+    fn sub_expr(&mut self) -> Result<SubExpr, ZuError> {
+        if self.peek_ident_is("if") {
+            let pos = self.next().pos;
+            let cond = self.expr()?;
+            if !self.eat_ident("then") {
+                return Err(ZuError::at(self.peek().pos, "expected `then`"));
+            }
+            let t = self.sub_expr()?;
+            if !self.eat_ident("else") {
+                return Err(ZuError::at(self.peek().pos, "expected `else`"));
+            }
+            let f = self.sub_expr()?;
+            return Ok(SubExpr::If(cond, Box::new(t), Box::new(f), pos));
+        }
+        self.expect(Tok::LBracket)?;
+        let mut calls = Vec::new();
+        if self.peek().tok != Tok::RBracket {
+            loop {
+                let (name, pos) = self.ident("a subscription (every)")?;
+                if name != "every" {
+                    return Err(ZuError::at(
+                        pos,
+                        format!("unknown subscription `{name}` (available: every)"),
+                    ));
+                }
+                self.expect(Tok::LParen)?;
+                let ms = self.int_lit("interval milliseconds")?;
+                self.expect(Tok::Comma)?;
+                let (msg, _) = self.ident("message name")?;
+                self.expect(Tok::RParen)?;
+                calls.push(SubCall { ms, msg, pos });
+                if self.peek().tok != Tok::Comma {
+                    break;
+                }
+                self.next();
+            }
+        }
+        self.expect(Tok::RBracket)?;
+        Ok(SubExpr::List(calls))
+    }
+
+    fn int_lit(&mut self, what: &str) -> Result<i64, ZuError> {
+        let t = self.next();
+        match t.tok {
+            Tok::Int(n) => Ok(n),
+            other => Err(ZuError::at(
+                t.pos,
+                format!("expected {what} as an integer literal, found {other}"),
+            )),
+        }
     }
 
     fn element(&mut self) -> Result<Element, ZuError> {
@@ -564,12 +679,17 @@ impl Parser {
 
     fn mul(&mut self) -> Result<Expr, ZuError> {
         let mut lhs = self.unary()?;
-        while self.peek().tok == Tok::Star {
+        loop {
+            let op = match self.peek().tok {
+                Tok::Star => Op::Mul,
+                Tok::Slash => Op::Div,
+                Tok::Percent => Op::Rem,
+                _ => return Ok(lhs),
+            };
             let pos = self.next().pos;
             let rhs = self.unary()?;
-            lhs = Expr::Bin(Op::Mul, Box::new(lhs), Box::new(rhs), pos);
+            lhs = Expr::Bin(op, Box::new(lhs), Box::new(rhs), pos);
         }
-        Ok(lhs)
     }
 
     fn unary(&mut self) -> Result<Expr, ZuError> {

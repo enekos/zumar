@@ -408,6 +408,98 @@ view = div [] []
         assert!(err.msg.contains("what `none` is"), "{err}");
     }
 
+    const CLOCK: &str = r#"
+app Clock
+model { now: Int, running: Bool, quote: String, pinged: String }
+init = { now = 0, running = true, quote = "loading", pinged = "" } then httpGet("./quote.txt", Got)
+msg Tick Int | Toggle | Refetch | Got String | Ping | Pong
+update Tick t = { now = t }
+update Toggle = { running = not model.running }
+update Refetch = { quote = "..." } then httpGet("./quote.txt", Got)
+update Got s = { quote = s }
+update Ping = { pinged = "ping..." } then delay(1500, Pong)
+update Pong = { pinged = "pong!" }
+sub = if model.running then [ every(1000, Tick) ] else []
+view =
+  div [] [
+    span [class "sec"] [ text show((model.now / 1000) % 60) ],
+    button [onClick Toggle] [ text (if model.running then "stop" else "start") ],
+    p [class "q"] [ text model.quote ],
+    button [onClick Refetch] [ text "refetch" ],
+    button [onClick Ping] [ text "ping" ],
+    span [] [ text model.pinged ]
+  ]
+"#;
+
+    #[test]
+    fn clock_effects_compile_and_lower() {
+        let rs = gen_rs(CLOCK);
+        for needle in [
+            // commands from update arms + init
+            "return vec![zumar_runtime::http_get(\"./quote.txt\".to_string(), __http_got)];",
+            "return vec![zumar_runtime::delay(1500, Msg::Pong)];",
+            ".with_init(vec![zumar_runtime::http_get(",
+            // http callback fn: body on ok, error text otherwise
+            "fn __http_got(r: zumar_runtime::effects::HttpResult) -> Msg {",
+            // clocked subscription with model-driven lifecycle
+            "fn __tick_tick(now: f64) -> Msg {",
+            "zumar_runtime::every_with_now(1000, __tick_tick)",
+            ".with_subscriptions(subs)",
+            "if model.running { vec![zumar_runtime::every_with_now(1000, __tick_tick)] } else { vec![] }",
+            // div/rem lower checked
+            ".checked_div(1000i64).unwrap_or(0)",
+            ".checked_rem(60i64).unwrap_or(0)",
+        ] {
+            assert!(rs.contains(needle), "missing {needle:?} in:\n{rs}");
+        }
+    }
+
+    #[test]
+    fn delay_msg_must_be_payload_less() {
+        let src = CLOCK.replace("delay(1500, Pong)", "delay(1500, Got)");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("delay fires `Got`"), "{err}");
+    }
+
+    #[test]
+    fn httpget_ctor_must_take_string() {
+        let src = CLOCK.replace(
+            "httpGet(\"./quote.txt\", Got)",
+            "httpGet(\"./quote.txt\", Pong)",
+        );
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("must take a String payload"), "{err}");
+    }
+
+    #[test]
+    fn every_msg_payload_is_none_or_int() {
+        let src = CLOCK.replace("every(1000, Tick)", "every(1000, Got)");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("takes a String"), "{err}");
+    }
+
+    #[test]
+    fn sub_condition_must_be_bool() {
+        let src = CLOCK.replace("if model.running then", "if model.now then");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("`sub` condition must be Bool"), "{err}");
+    }
+
+    #[test]
+    fn division_by_zero_is_zero_not_panic() {
+        let src = r#"
+app D
+model { n: Int }
+init = { n = 0 }
+msg M
+update M = { n = (10 / model.n) + (10 % model.n) }
+view = div [] [ text show(model.n) ]
+"#;
+        let rs = gen_rs(src);
+        assert!(rs.contains("checked_div"), "{rs}");
+        assert!(rs.contains("checked_rem"), "{rs}");
+    }
+
     #[test]
     fn pathological_nesting_errors_cleanly() {
         let bomb = format!(

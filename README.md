@@ -105,11 +105,29 @@ So reading the front of a possibly-empty list can't skip the empty case —
 the same totality rule as messages, extended to optionals. See
 `examples/lang-queue`.
 
+Effects are part of the language: an update (or `init`) can request
+commands with `then`, and a `sub` declaration derives subscriptions from
+the model — the runtime starts and stops them as the model changes:
+
+```
+init = { ... } then httpGet("./quote.txt", Got)
+
+update Ping = { pinged = "ping..." } then delay(1500, Pong)
+
+sub = if model.running then [ every(1000, Tick) ] else []
+```
+
+`httpGet(url, Ctor)` delivers the body to a String-payload message (or
+`"error <status>"` on failure); `every(ms, Msg)` fires a payload-less
+message, or passes the clock when the message takes an Int. Arithmetic
+includes `/` and `%`, with division by zero yielding 0, Elm's rule. See
+`examples/lang-clock`.
+
 ### Not there yet
 
 No *user-defined* sum types or general pattern matching (only the built-in
-`Maybe`/`case`), no `fold`/lambdas, and no effects syntax in the language.
-Those come before or alongside the WasmGC backend.
+`Maybe`/`case`), and no `fold`/lambdas. The WasmGC backend doesn't take
+effects yet — apps using `then`/`sub` build on the default Rust backend.
 
 ## The protocol
 
@@ -148,7 +166,8 @@ verbatim.
   GC modules run in normal browser pages. Not yet there: `Maybe`, Bool
   payloads, nested `for`, effects.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
-  and lang-counter / lang-todo / lang-expenses / lang-queue (compiled from `.zu`).
+  and lang-counter / lang-todo / lang-expenses / lang-queue / lang-clock
+  (compiled from `.zu`).
 - `spikes/wasmgc` — findings + harnesses for the GC backend.
 
 ## Numbers
@@ -195,7 +214,9 @@ python3 -m http.server 8765 -d www
    diff; findings in `spikes/wasmgc`)~~
 7. ~~GC backend: strings, records, `for` regions, payloads — counter,
    hello, and todo all run on it~~
-8. next: user-defined sum types + general pattern matching; effects (both
-   backends); GC backend gaps (`Maybe`, Bool payloads, nested `for`).
+8. ~~effects in the language: `then` commands, `sub` subscriptions, `/`
+   and `%` (`clock.zu`)~~
+9. next: user-defined sum types + general pattern matching; effects on the
+   GC backend; GC gaps (`Maybe`, Bool payloads, nested `for`).
 
 MIT.

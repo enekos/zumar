@@ -195,8 +195,79 @@ impl Checker {
             }
         }
 
-        let env: Env = vec![(String::from("model"), Ty::Record(MODEL.into()))];
-        self.check_element(&app.view, &env)
+        // Commands: from init (empty env) and from update arms (model env —
+        // command arguments like URLs may read the model).
+        let model_env: Env = vec![(String::from("model"), Ty::Record(MODEL.into()))];
+        for cmd in &app.init_cmds {
+            self.check_cmd(cmd, &Env::new())?;
+        }
+        for u in &app.updates {
+            for cmd in &u.cmds {
+                self.check_cmd(cmd, &model_env)?;
+            }
+        }
+        if let Some(subs) = &app.subs {
+            self.check_subs(subs, &model_env)?;
+        }
+
+        self.check_element(&app.view, &model_env)
+    }
+
+    fn check_cmd(&self, cmd: &CmdCall, env: &Env) -> Result<(), ZuError> {
+        match cmd {
+            CmdCall::Delay { msg, pos, .. } => match self.msgs.get(msg) {
+                None => Err(ZuError::at(
+                    *pos,
+                    format!("`{msg}` is not a declared message"),
+                )),
+                Some(None) => Ok(()),
+                Some(Some(t)) => Err(ZuError::at(
+                    *pos,
+                    format!("delay fires `{msg}` with no payload, but `{msg}` takes a {t}"),
+                )),
+            },
+            CmdCall::HttpGet { url, ctor, pos } => {
+                self.expect(url, &Ty::Str, env, "httpGet url")?;
+                match self.msgs.get(ctor) {
+                    None => Err(ZuError::at(*pos, format!("`{ctor}` is not a declared message"))),
+                    Some(Some(Ty::Str)) => Ok(()),
+                    Some(_) => Err(ZuError::at(
+                        *pos,
+                        format!("httpGet delivers a String to `{ctor}`, so `{ctor}` must take a String payload"),
+                    )),
+                }
+            }
+        }
+    }
+
+    fn check_subs(&self, subs: &SubExpr, env: &Env) -> Result<(), ZuError> {
+        match subs {
+            SubExpr::List(calls) => {
+                for c in calls {
+                    match self.msgs.get(&c.msg) {
+                        None => {
+                            return Err(ZuError::at(
+                                c.pos,
+                                format!("`{}` is not a declared message", c.msg),
+                            ))
+                        }
+                        Some(None) | Some(Some(Ty::Int)) => {}
+                        Some(Some(t)) => {
+                            return Err(ZuError::at(
+                                c.pos,
+                                format!("every fires `{}` with no payload or the clock (Int ms), but `{}` takes a {t}", c.msg, c.msg),
+                            ))
+                        }
+                    }
+                }
+                Ok(())
+            }
+            SubExpr::If(cond, t, f, pos) => {
+                self.expect_ty(cond, &Ty::Bool, env, *pos, "`sub` condition must be Bool")?;
+                self.check_subs(t, env)?;
+                self.check_subs(f, env)
+            }
+        }
     }
 
     fn check_element(&self, el: &Element, env: &Env) -> Result<(), ZuError> {
@@ -479,7 +550,7 @@ impl Checker {
         let lt = self.infer(l, None, env)?;
         let rt = self.infer(r, None, env)?;
         match op {
-            Op::Add | Op::Sub | Op::Mul => {
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Rem => {
                 if lt != Ty::Int || rt != Ty::Int {
                     return Err(ZuError::at(
                         pos,

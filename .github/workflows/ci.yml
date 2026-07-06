@@ -46,6 +46,12 @@ jobs:
           cargo run --release -p zumar-lang --bin zuc -- build \
             examples/lang-counter/counter.zu --out /tmp/zu-app --zumar "$PWD"
           wasm-pack build /tmp/zu-app --target web --out-dir /tmp/zu-app/pkg --release
+      - name: effects from .zu (clock.zu end-to-end)
+        run: |
+          cd examples/lang-clock
+          cargo run --release -p zumar-lang --bin zuc -- build clock.zu --out app --zumar "$PWD/../.."
+          wasm-pack build app --target web --out-dir ../www/pkg --release
+          cd www && cp ../test.mjs . && node test.mjs
       - name: wasmgc backend (emit counter/hello/todo, run behavior harnesses)
         run: |
           for app in counter hello todo; do

@@ -23,6 +23,8 @@ pub enum Tok {
     Minus,
     Arrow, // ->
     Star,
+    Slash,
+    Percent,
     Lt,
     Gt,
     Eof,
@@ -57,6 +59,8 @@ impl std::fmt::Display for Tok {
                     Tok::Minus => "-",
                     Tok::Arrow => "->",
                     Tok::Star => "*",
+                    Tok::Slash => "/",
+                    Tok::Percent => "%",
                     Tok::Lt => "<",
                     Tok::Gt => ">",
                     _ => unreachable!(),
@@ -109,7 +113,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
                     }
                 }
             }
-            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '|' | '.' | '*' | '<' | '>' => {
+            '{' | '}' | '[' | ']' | '(' | ')' | ',' | ':' | '|' | '.' | '*' | '/' | '%' | '<'
+            | '>' => {
                 chars.next();
                 col += 1;
                 push!(
@@ -125,6 +130,8 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
                         '|' => Tok::Pipe,
                         '.' => Tok::Dot,
                         '*' => Tok::Star,
+                        '/' => Tok::Slash,
+                        '%' => Tok::Percent,
                         '<' => Tok::Lt,
                         '>' => Tok::Gt,
                         _ => unreachable!(),

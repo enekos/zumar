@@ -97,11 +97,42 @@ pub enum Op {
     Add,
     Sub,
     Mul,
+    /// Integer division; division by zero yields 0 (Elm's rule).
+    Div,
+    /// Remainder; by zero yields 0.
+    Rem,
     Concat,
     Eq,
     Ne,
     Lt,
     Gt,
+}
+
+/// A command requested by `init` or an `update` arm (`... then cmd, cmd`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum CmdCall {
+    /// `delay(ms, Msg)` — Msg must be payload-less.
+    Delay { ms: i64, msg: String, pos: Pos },
+    /// `httpGet(url, Ctor)` — Ctor takes a String: the body on success,
+    /// `"error <status>"` on failure.
+    HttpGet { url: Expr, ctor: String, pos: Pos },
+}
+
+/// `every(ms, Msg)` — Msg payload-less, or `Msg Int` to receive the
+/// shim's clock (ms since epoch).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubCall {
+    pub ms: i64,
+    pub msg: String,
+    pub pos: Pos,
+}
+
+/// The `sub = ...` declaration: a list of subscriptions, possibly chosen
+/// by model state. Recomputed after every update; the runtime diffs it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubExpr {
+    List(Vec<SubCall>),
+    If(Expr, Box<SubExpr>, Box<SubExpr>, Pos),
 }
 
 /// A message value in event position: `Reverse` or `Delete(t.id)`.
@@ -183,6 +214,8 @@ pub struct Update {
     /// The bound payload variable, when the message carries one.
     pub var: Option<(String, Pos)>,
     pub fields: Record,
+    /// Commands requested alongside this update (`... then cmd, cmd`).
+    pub cmds: Vec<CmdCall>,
     pub pos: Pos,
 }
 
@@ -192,8 +225,12 @@ pub struct App {
     pub records: Vec<RecordDef>,
     pub model: Vec<(String, Ty, Pos)>,
     pub init: Record,
+    /// Commands fired right after the first render (`init = {...} then cmd`).
+    pub init_cmds: Vec<CmdCall>,
     pub msgs: Vec<MsgDef>,
     pub updates: Vec<Update>,
+    /// The `sub = ...` declaration, when present.
+    pub subs: Option<SubExpr>,
     pub view: Element,
 }
 

@@ -169,9 +169,40 @@ impl Gen {
             for (name, _, _) in &u.fields {
                 o.push_str(&format!("            model.{name} = __new_{name};\n"));
             }
+            if !u.cmds.is_empty() {
+                o.push_str(&format!(
+                    "            return vec![{}];\n",
+                    self.emit_cmds(&u.cmds, &env)
+                ));
+            }
             o.push_str("        }\n");
         }
         o.push_str("    }\n    Vec::new()\n}\n\n");
+
+        // Effect callbacks: one named fn per httpGet ctor and per clocked
+        // `every` ctor (the runtime takes fn pointers, not closures).
+        for ctor in self.http_ctors(app) {
+            o.push_str(&format!(
+                "fn __http_{lc}(r: zumar_runtime::effects::HttpResult) -> Msg {{\n    Msg::{ctor}(if r.ok {{ r.body }} else {{ format!(\"error {{}}\", r.status) }})\n}}\n\n",
+                lc = ctor.to_lowercase(),
+            ));
+        }
+        for ctor in self.clocked_sub_ctors(app) {
+            o.push_str(&format!(
+                "fn __tick_{lc}(now: f64) -> Msg {{\n    Msg::{ctor}(now as i64)\n}}\n\n",
+                lc = ctor.to_lowercase(),
+            ));
+        }
+
+        // subs.
+        if let Some(subs) = &app.subs {
+            let env: Env = vec![("model".into(), Ty::Record(MODEL.into()))];
+            o.push_str(
+                "#[allow(unused_variables)]\nfn subs(model: &Model) -> Vec<zumar_runtime::effects::Sub<Msg>> {\n    ",
+            );
+            o.push_str(&self.emit_subs(subs, app, &env));
+            o.push_str("\n}\n\n");
+        }
 
         // view.
         o.push_str("fn view(model: &Model) -> VNode<Msg> {\n");
@@ -181,8 +212,115 @@ impl Gen {
             "    let __root = {root};\n    VNode::from(__root)\n}}\n\n"
         ));
 
-        o.push_str("zumar_runtime::zumar_app!(App, Model, Msg, Program::new(init_model(), update, view));\n");
+        let mut program = String::from("Program::new(init_model(), update, view)");
+        if app.subs.is_some() {
+            program.push_str(".with_subscriptions(subs)");
+        }
+        if !app.init_cmds.is_empty() {
+            program.push_str(&format!(
+                ".with_init(vec![{}])",
+                self.emit_cmds(&app.init_cmds, &Env::new())
+            ));
+        }
+        o.push_str(&format!(
+            "zumar_runtime::zumar_app!(App, Model, Msg, {program});\n"
+        ));
         o
+    }
+
+    fn http_ctors(&self, app: &App) -> Vec<String> {
+        let mut ctors: Vec<String> = Vec::new();
+        let all = app
+            .init_cmds
+            .iter()
+            .chain(app.updates.iter().flat_map(|u| u.cmds.iter()));
+        for cmd in all {
+            if let CmdCall::HttpGet { ctor, .. } = cmd {
+                if !ctors.contains(ctor) {
+                    ctors.push(ctor.clone());
+                }
+            }
+        }
+        ctors
+    }
+
+    fn clocked_sub_ctors(&self, app: &App) -> Vec<String> {
+        let mut ctors = Vec::new();
+        fn walk(subs: &SubExpr, app: &App, out: &mut Vec<String>) {
+            match subs {
+                SubExpr::List(calls) => {
+                    for c in calls {
+                        let clocked = app
+                            .msgs
+                            .iter()
+                            .any(|m| m.name == c.msg && m.payload.is_some());
+                        if clocked && !out.contains(&c.msg) {
+                            out.push(c.msg.clone());
+                        }
+                    }
+                }
+                SubExpr::If(_, t, f, _) => {
+                    walk(t, app, out);
+                    walk(f, app, out);
+                }
+            }
+        }
+        if let Some(subs) = &app.subs {
+            walk(subs, app, &mut ctors);
+        }
+        ctors
+    }
+
+    fn emit_cmds(&self, cmds: &[CmdCall], env: &Env) -> String {
+        cmds.iter()
+            .map(|cmd| match cmd {
+                CmdCall::Delay { ms, msg, .. } => {
+                    format!("zumar_runtime::delay({ms}, Msg::{msg})")
+                }
+                CmdCall::HttpGet { url, ctor, .. } => {
+                    let (code, _) = self.emit(url, Some(&Ty::Str), env);
+                    format!(
+                        "zumar_runtime::http_get({code}, __http_{})",
+                        ctor.to_lowercase()
+                    )
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn emit_subs(&self, subs: &SubExpr, app: &App, env: &Env) -> String {
+        match subs {
+            SubExpr::List(calls) => {
+                let items: Vec<String> = calls
+                    .iter()
+                    .map(|c| {
+                        let clocked = app
+                            .msgs
+                            .iter()
+                            .any(|m| m.name == c.msg && m.payload.is_some());
+                        if clocked {
+                            format!(
+                                "zumar_runtime::every_with_now({}, __tick_{})",
+                                c.ms,
+                                c.msg.to_lowercase()
+                            )
+                        } else {
+                            format!("zumar_runtime::every({}, Msg::{})", c.ms, c.msg)
+                        }
+                    })
+                    .collect();
+                format!("vec![{}]", items.join(", "))
+            }
+            SubExpr::If(cond, t, f, _) => {
+                let (cc, _) = self.emit(cond, Some(&Ty::Bool), env);
+                format!(
+                    "(if {cc} {{ {} }} else {{ {} }})",
+                    self.emit_subs(t, app, env),
+                    self.emit_subs(f, app, env)
+                )
+            }
+        }
     }
 
     // --- view ------------------------------------------------------------
@@ -487,6 +625,17 @@ impl Gen {
                     _ => "*",
                 };
                 (format!("({a} {sym} {b})"), Ty::Int)
+            }
+            // Division/remainder by zero yield 0 (Elm's rule) — no panics.
+            Op::Div | Op::Rem => {
+                let (a, _) = self.emit(l, Some(&Ty::Int), env);
+                let (b, _) = self.emit(r, Some(&Ty::Int), env);
+                let method = if op == Op::Div {
+                    "checked_div"
+                } else {
+                    "checked_rem"
+                };
+                (format!("(({a}).{method}({b}).unwrap_or(0))"), Ty::Int)
             }
             Op::Concat => {
                 let (a, at) = self.emit(l, None, env);

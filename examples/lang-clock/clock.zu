@@ -1,0 +1,36 @@
+# clock.zu — effects in the language.
+# Commands (`then delay/httpGet`), an init-time fetch, and a `sub`
+# declaration whose lifecycle follows the model: stop the clock and the
+# runtime tears the interval down.
+
+app Clock
+
+model { now: Int, running: Bool, quote: String, pinged: String }
+
+init = { now = 0, running = true, quote = "loading...", pinged = "" }
+  then httpGet("./quote.txt", Got)
+
+msg Tick Int | Toggle | Refetch | Got String | Ping | Pong
+
+update Tick t = { now = t }
+update Toggle = { running = not model.running }
+update Refetch = { quote = "..." } then httpGet("./quote.txt", Got)
+update Got s = { quote = s }
+update Ping = { pinged = "ping..." } then delay(1500, Pong)
+update Pong = { pinged = "pong! (1.5s later)" }
+
+sub = if model.running then [ every(1000, Tick) ] else []
+
+view =
+  div [class "clock"] [
+    h1 [] [ text "clock.zu" ],
+    p [class "sub"] [ text "effects, straight from the language" ],
+    div [class "sec"] [ text (show((model.now / 1000) % 60) ++ "s") ],
+    button [onClick Toggle] [ text (if model.running then "stop" else "start") ],
+    blockquote [] [ text model.quote ],
+    div [class "row"] [
+      button [onClick Refetch] [ text "refetch" ],
+      button [onClick Ping] [ text "ping" ],
+      span [class "toast"] [ text model.pinged ]
+    ]
+  ]
