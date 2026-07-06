@@ -35,6 +35,7 @@
 //! postfix := atom ("." IDENT)*
 //! atom    := INT | STRING | "true" | "false" | "none" | IDENT
 //!          | "show"|"length"|"sum"|"toInt"|"reverse"|"head"|"some" "(" expr ")"
+//!          | "fold" "(" expr "," expr "," IDENT IDENT "->" expr ")"
 //!          | "nth" "(" expr "," expr "," expr ")"
 //!          | "[" expr,* "]" | "{" recordbody "}" | "(" expr ")" | "-" atom
 //! ```
@@ -61,9 +62,9 @@ pub fn parse(src: &str) -> Result<App, ZuError> {
 
 /// Recursion guard for `expr`/`element`: pathological nesting must produce a
 /// clean error, not a compiler stack overflow. Each guarded level fans out
-/// into ~8 precedence frames, so the cap stays well under what a 2 MB thread
-/// stack holds — and far above any real program's nesting.
-const MAX_DEPTH: usize = 96;
+/// into ~10 precedence/branch frames, so the cap stays well under what a
+/// 2 MB thread stack holds — and far above any real program's nesting.
+const MAX_DEPTH: usize = 64;
 
 struct Parser {
     toks: Vec<Token>,
@@ -774,6 +775,26 @@ impl Parser {
                 "toInt" => Ok(Expr::ToInt(Box::new(self.paren_arg()?), t.pos)),
                 "reverse" => Ok(Expr::Reverse(Box::new(self.paren_arg()?), t.pos)),
                 "head" => Ok(Expr::Head(Box::new(self.paren_arg()?), t.pos)),
+                "fold" => {
+                    self.expect(Tok::LParen)?;
+                    let list = self.expr()?;
+                    self.expect(Tok::Comma)?;
+                    let init = self.expr()?;
+                    self.expect(Tok::Comma)?;
+                    let (acc, _) = self.ident("accumulator name")?;
+                    let (item, _) = self.ident("item name")?;
+                    self.expect(Tok::Arrow)?;
+                    let body = self.expr()?;
+                    self.expect(Tok::RParen)?;
+                    Ok(Expr::Fold {
+                        list: Box::new(list),
+                        init: Box::new(init),
+                        acc,
+                        item,
+                        body: Box::new(body),
+                        pos: t.pos,
+                    })
+                }
                 "none" => Ok(Expr::None(t.pos)),
                 "some" => Ok(Expr::Some(Box::new(self.paren_arg()?), t.pos)),
                 "nth" => {

@@ -25,7 +25,7 @@ export function gcApp(exports) {
       eventNames = peekEventNames(bytes);
       return bytes;
     },
-    dispatch(path, name, value) {
+    dispatch(path, name, value, checked) {
       const idx = eventNames.indexOf(name);
       if (idx < 0) return EMPTY_UPDATE;
       new Uint32Array(mem.buffer, path_buf.value, path.length).set(path);
@@ -35,7 +35,7 @@ export function gcApp(exports) {
         new Uint8Array(mem.buffer, payload_buf.value, bytes.length).set(bytes);
         payloadLen = bytes.length;
       }
-      return read(dispatch(idx, path.length, payloadLen));
+      return read(dispatch(idx, path.length, payloadLen, checked === true ? 1 : 0));
     },
     resolve(id, ok, status, body) {
       if (!resolve) return EMPTY_UPDATE;

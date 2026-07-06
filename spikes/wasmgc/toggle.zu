@@ -1,0 +1,11 @@
+# toggle.zu — onCheck / Bool payloads on the GC backend (harness fixture).
+app Toggle
+model { dark: Bool, label: String }
+init = { dark = false, label = "light" }
+msg SetDark Bool
+update SetDark b = { dark = b, label = if b then "dark" else "light" }
+view =
+  div [] [
+    input [type "checkbox", onCheck SetDark] [],
+    span [class (if model.dark then "on" else "off")] [ text model.label ]
+  ]

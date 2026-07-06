@@ -642,6 +642,30 @@ impl Gen {
                 let body = self.emit_record_fields(&name, fields, env);
                 (format!("{name} {{ {body}, ..{base_code} }}"), bty)
             }
+            Expr::Fold {
+                list,
+                init,
+                acc,
+                item,
+                body,
+                ..
+            } => {
+                let (src, _) = self.emit(list, None, env);
+                let elem = self.list_elem(list, env);
+                let (init_code, acc_ty) = self.emit(init, expected, env);
+                let mut inner = env.clone();
+                inner.push((acc.clone(), acc_ty.clone()));
+                inner.push((item.clone(), elem));
+                let (body_code, _) = self.emit(body, Some(&acc_ty), &inner);
+                let d = self.fresh();
+                (
+                    format!(
+                        "{{ let mut __f{d}: {} = {init_code}; for {item} in ({src}).iter() {{ let {acc} = __f{d}; __f{d} = {body_code}; }} __f{d} }}",
+                        rust_ty(&acc_ty)
+                    ),
+                    acc_ty,
+                )
+            }
             Expr::For {
                 var,
                 list,
@@ -838,6 +862,7 @@ impl Gen {
             }
             Expr::RecordLit(fields, _) => Ty::Record(self.resolve_record(fields, None)),
             Expr::RecordUpdate(base, _, _) => self.type_of(base, env),
+            Expr::Fold { init, .. } => self.type_of(init, env),
             Expr::For {
                 var, list, body, ..
             } => {

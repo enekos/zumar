@@ -36,7 +36,7 @@ use wasm_encoder::{
     MemArg, MemorySection, MemoryType, Module, RefType, StartSection, StorageType, TypeSection,
     ValType,
 };
-use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, ValueKind, MODEL};
+use zumar_lang::ast::{App, Attr, Child, Element, Expr, Op, Pos, Ty, MODEL};
 
 const WIRE_VERSION: u8 = 1;
 
@@ -58,7 +58,8 @@ const F_MEM2STR: u32 = 4;
 const F_CONCAT_STR: u32 = 5;
 const F_STREQ: u32 = 6;
 const F_WSTRGC: u32 = 7;
-const F_FIXED: u32 = 8;
+const F_ATOI: u32 = 8;
+const F_FIXED: u32 = 9;
 
 // Globals.
 const G_STATE: u32 = 0;
@@ -120,8 +121,12 @@ impl Pool {
 enum Slot {
     PayloadStr,
     PayloadInt,
+    /// A Bool event payload (0/1 in the i64 payload global).
+    PayloadBool,
     /// A loop variable: local index + its record's name.
     Item(u32, String),
+    /// A general scalar binding (fold accumulator): local index + type.
+    Local(u32, Ty),
 }
 
 /// Per-function codegen context: scope + temp-local allocation.
@@ -285,7 +290,7 @@ impl<'a> Emitter<'a> {
         }
         for m in &app.msgs {
             match &m.payload {
-                None | Some(Ty::Str) | Some(Ty::Int) => {}
+                None | Some(Ty::Str) | Some(Ty::Int) | Some(Ty::Bool) => {}
                 Some(other) => {
                     return Err(unsupported(m.pos, &format!("`{other}` message payloads")))
                 }
@@ -524,6 +529,9 @@ impl<'a> Emitter<'a> {
     fn t_notify(&self) -> u32 {
         self.ft(10 + 2 * self.n_records() + 1)
     }
+    fn t_atoi(&self) -> u32 {
+        self.ft(10 + 2 * self.n_records() + 2)
+    }
 
     fn field_index(&self, name: &str) -> u32 {
         self.fields
@@ -609,11 +617,18 @@ impl<'a> Emitter<'a> {
             Expr::Var(v, _) => match ctx.lookup(v) {
                 Some(Slot::PayloadStr) => Ty::Str,
                 Some(Slot::PayloadInt) => Ty::Int,
+                Some(Slot::PayloadBool) => Ty::Bool,
                 Some(Slot::Item(_, r)) => Ty::Record(r),
+                Some(Slot::Local(_, t)) => t,
                 None => match self.enum_tags.get(v) {
                     Some((owner, _)) => Ty::Enum(owner.clone()),
                     None => Ty::Int,
                 },
+            },
+            Expr::Fold { init, .. } => self.ty_of(init, ctx),
+            Expr::Head(list, _) => match self.ty_of(list, ctx) {
+                Ty::List(t) => Ty::Maybe(t),
+                _ => Ty::Int,
             },
             Expr::Case { arms, .. } => arms
                 .first()
@@ -840,15 +855,7 @@ impl<'a> Emitter<'a> {
                         },
                     });
                 }
-                Attr::OnValue {
-                    event,
-                    ctor,
-                    kind,
-                    pos,
-                } => {
-                    if *kind == ValueKind::Checked {
-                        return Err(unsupported(*pos, "`onCheck` (Bool payloads)"));
-                    }
+                Attr::OnValue { event, ctor, .. } => {
                     let msg = self.msg_index(ctor);
                     self.events.entry(event.clone()).or_insert(false);
                     self.handlers.push(Handler {
@@ -899,15 +906,7 @@ impl<'a> Emitter<'a> {
                         },
                     });
                 }
-                Attr::OnValue {
-                    event,
-                    ctor,
-                    kind,
-                    pos,
-                } => {
-                    if *kind == ValueKind::Checked {
-                        return Err(unsupported(*pos, "`onCheck` (Bool payloads)"));
-                    }
+                Attr::OnValue { event, ctor, .. } => {
                     let msg = self.msg_index(ctor);
                     self.events.entry(event.clone()).or_insert(false);
                     self.handlers.push(Handler {
@@ -954,6 +953,7 @@ impl<'a> Emitter<'a> {
             Expr::Int(n) => out.push(I::I64Const(*n)),
             Expr::Var(v, pos) => match ctx.lookup(v) {
                 Some(Slot::PayloadInt) => out.push(I::GlobalGet(G_PAYLOAD_I64)),
+                Some(Slot::Local(l, Ty::Int)) => out.push(I::LocalGet(l)),
                 _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
             },
             Expr::Field(..) => self.place(e, ctx, out)?,
@@ -1013,6 +1013,11 @@ impl<'a> Emitter<'a> {
             Expr::Case { scrut, arms, .. } => {
                 self.case_expr_gc(scrut, arms, &Ty::Int, ctx, out)?;
             }
+            Expr::ToInt(inner, _) => {
+                self.str_expr(inner, ctx, out)?;
+                out.push(I::Call(F_ATOI));
+            }
+            Expr::Fold { .. } => self.fold_gc(e, &Ty::Int, ctx, out)?,
             other => return Err(unsupported(pos_of(other), "this expression")),
         }
         Ok(())
@@ -1037,6 +1042,7 @@ impl<'a> Emitter<'a> {
             }
             Expr::Var(v, pos) => match ctx.lookup(v) {
                 Some(Slot::PayloadStr) => out.push(I::GlobalGet(G_PAYLOAD)),
+                Some(Slot::Local(l, Ty::Str)) => out.push(I::LocalGet(l)),
                 _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
             },
             Expr::Field(..) => self.place(e, ctx, out)?,
@@ -1060,6 +1066,7 @@ impl<'a> Emitter<'a> {
             Expr::Case { scrut, arms, .. } => {
                 self.case_expr_gc(scrut, arms, &Ty::Str, ctx, out)?;
             }
+            Expr::Fold { .. } => self.fold_gc(e, &Ty::Str, ctx, out)?,
             other => return Err(unsupported(pos_of(other), "this text expression")),
         }
         Ok(())
@@ -1074,6 +1081,14 @@ impl<'a> Emitter<'a> {
     ) -> Result<(), String> {
         match e {
             Expr::Bool(b) => out.push(I::I32Const(*b as i32)),
+            Expr::Var(v, pos) => match ctx.lookup(v) {
+                Some(Slot::PayloadBool) => {
+                    out.push(I::GlobalGet(G_PAYLOAD_I64));
+                    out.push(I::I32WrapI64);
+                }
+                Some(Slot::Local(l, Ty::Bool)) => out.push(I::LocalGet(l)),
+                _ => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
+            },
             Expr::Not(inner, _) => {
                 self.bool_expr(inner, ctx, out)?;
                 out.push(I::I32Eqz);
@@ -1106,6 +1121,7 @@ impl<'a> Emitter<'a> {
             Expr::Case { scrut, arms, .. } => {
                 self.case_expr_gc(scrut, arms, &Ty::Bool, ctx, out)?;
             }
+            Expr::Fold { .. } => self.fold_gc(e, &Ty::Bool, ctx, out)?,
             other => return Err(unsupported(pos_of(other), "this condition")),
         }
         Ok(())
@@ -1282,15 +1298,14 @@ impl<'a> Emitter<'a> {
         out: &mut Vec<I<'static>>,
     ) -> Result<(), String> {
         match e {
-            Expr::Var(v, pos) => {
-                if ctx.lookup(v).is_some() {
-                    return Err(unsupported(*pos, &format!("variable `{v}` here")));
-                }
-                match self.enum_tags.get(v) {
+            Expr::Var(v, pos) => match ctx.lookup(v) {
+                Some(Slot::Local(l, Ty::Enum(_))) => out.push(I::LocalGet(l)),
+                Some(_) => return Err(unsupported(*pos, &format!("variable `{v}` here"))),
+                None => match self.enum_tags.get(v) {
                     Some((_, tag)) => out.push(I::I32Const(*tag as i32)),
                     None => return Err(unsupported(*pos, &format!("`{v}` here"))),
-                }
-            }
+                },
+            },
             Expr::Field(..) => self.place(e, ctx, out)?,
             Expr::If(c, t, f, _) => {
                 self.bool_expr(c, ctx, out)?;
@@ -1309,6 +1324,74 @@ impl<'a> Emitter<'a> {
         Ok(())
     }
 
+    /// fold over a record list, inlined as a loop (the lambda is syntactic).
+    fn fold_gc(
+        &mut self,
+        e: &Expr,
+        ty: &Ty,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let Expr::Fold {
+            list,
+            init,
+            acc,
+            item,
+            body,
+            pos,
+        } = e
+        else {
+            unreachable!()
+        };
+        let Ty::List(elem) = self.ty_of(list, ctx) else {
+            return Err(unsupported(*pos, "this fold source"));
+        };
+        let Ty::Record(rec) = elem.as_ref() else {
+            return Err(unsupported(*pos, "folds over non-record lists"));
+        };
+        let rec = rec.clone();
+        let arr_idx = self.arr_idx(&rec);
+        let src = ctx.tmp(ValType::Ref(nullable(arr_idx)));
+        let n = ctx.tmp(ValType::I32);
+        let i = ctx.tmp(ValType::I32);
+        let t = ctx.tmp(ValType::Ref(nullable(self.rec_idx(&rec))));
+        let a = ctx.tmp(self.val_type(ty));
+
+        self.val_expr(init, ty, ctx, out)?;
+        out.push(I::LocalSet(a));
+        self.list_expr(list, ctx, out)?;
+        out.push(I::LocalSet(src));
+        out.push(I::LocalGet(src));
+        out.push(I::ArrayLen);
+        out.push(I::LocalSet(n));
+        out.push(I::Block(BlockType::Empty));
+        out.push(I::Loop(BlockType::Empty));
+        out.push(I::LocalGet(i));
+        out.push(I::LocalGet(n));
+        out.push(I::I32GeU);
+        out.push(I::BrIf(1));
+        out.push(I::LocalGet(src));
+        out.push(I::LocalGet(i));
+        out.push(I::ArrayGet(arr_idx));
+        out.push(I::LocalSet(t));
+        ctx.env.push((acc.clone(), Slot::Local(a, ty.clone())));
+        ctx.env.push((item.clone(), Slot::Item(t, rec.clone())));
+        let res = self.val_expr(body, ty, ctx, out);
+        ctx.env.pop();
+        ctx.env.pop();
+        res?;
+        out.push(I::LocalSet(a));
+        out.push(I::LocalGet(i));
+        out.push(I::I32Const(1));
+        out.push(I::I32Add);
+        out.push(I::LocalSet(i));
+        out.push(I::Br(0));
+        out.push(I::End);
+        out.push(I::End);
+        out.push(I::LocalGet(a));
+        Ok(())
+    }
+
     /// `case` over a payload-less enum, in any value position: an if-chain
     /// on the scrutinee's tag, the last arm as the else (the checker
     /// guarantees coverage).
@@ -1321,15 +1404,90 @@ impl<'a> Emitter<'a> {
         out: &mut Vec<I<'static>>,
     ) -> Result<(), String> {
         let sty = self.ty_of(scrut, ctx);
-        if !matches!(sty, Ty::Enum(_)) {
-            return Err(unsupported(pos_of(scrut), "`case` over Maybe values"));
+        match sty {
+            Ty::Enum(_) => {
+                let s = ctx.tmp(ValType::I32);
+                self.enum_expr(scrut, ctx, out)?;
+                out.push(I::LocalSet(s));
+                let vt = self.val_type(ty);
+                let ty = ty.clone();
+                self.case_chain(arms, 0, s, vt, &ty, ctx, out)
+            }
+            // Maybe of a record: null IS none, so `some(x)` is `x` and the
+            // case is a ref.is_null branch with the binder aliasing the
+            // (known non-null) scrutinee.
+            Ty::Maybe(inner) => {
+                let Ty::Record(rec) = inner.as_ref() else {
+                    return Err(unsupported(
+                        pos_of(scrut),
+                        "`case` over Maybe of a non-record",
+                    ));
+                };
+                let rec = rec.clone();
+                let m = ctx.tmp(ValType::Ref(nullable(self.rec_idx(&rec))));
+                self.maybe_expr(scrut, &rec, ctx, out)?;
+                out.push(I::LocalSet(m));
+                let none = arms
+                    .iter()
+                    .find(|a| a.ctor == "none")
+                    .expect("typechecked: none arm");
+                let some = arms
+                    .iter()
+                    .find(|a| a.ctor == "some")
+                    .expect("typechecked: some arm");
+                let vt = self.val_type(ty);
+                let ty = ty.clone();
+                out.push(I::LocalGet(m));
+                out.push(I::RefIsNull);
+                out.push(I::If(BlockType::Result(vt)));
+                self.val_expr(&none.body, &ty, ctx, out)?;
+                out.push(I::Else);
+                ctx.env.push((
+                    some.binder.clone().expect("typechecked: some binder"),
+                    Slot::Item(m, rec),
+                ));
+                let res = self.val_expr(&some.body, &ty, ctx, out);
+                ctx.env.pop();
+                res?;
+                out.push(I::End);
+                Ok(())
+            }
+            _ => Err(unsupported(pos_of(scrut), "this `case` scrutinee")),
         }
-        let s = ctx.tmp(ValType::I32);
-        self.enum_expr(scrut, ctx, out)?;
-        out.push(I::LocalSet(s));
-        let vt = self.val_type(ty);
-        let ty = ty.clone();
-        self.case_chain(arms, 0, s, vt, &ty, ctx, out)
+    }
+
+    /// A `Maybe <record>` value as a nullable record ref: `none` is null,
+    /// `some(x)` is x, `head(xs)` is a bounds-checked first element.
+    fn maybe_expr(
+        &mut self,
+        e: &Expr,
+        rec: &str,
+        ctx: &mut Ctx,
+        out: &mut Vec<I<'static>>,
+    ) -> Result<(), String> {
+        let rec_idx = self.rec_idx(rec);
+        match e {
+            Expr::None(_) => out.push(I::RefNull(HeapType::Concrete(rec_idx))),
+            Expr::Some(inner, _) => self.rec_expr(inner, rec, ctx, out)?,
+            Expr::Head(list, _) => {
+                let arr_idx = self.arr_idx(rec);
+                let src = ctx.tmp(ValType::Ref(nullable(arr_idx)));
+                self.list_expr(list, ctx, out)?;
+                out.push(I::LocalSet(src));
+                out.push(I::LocalGet(src));
+                out.push(I::ArrayLen);
+                out.push(I::I32Eqz);
+                out.push(I::If(BlockType::Result(ValType::Ref(nullable(rec_idx)))));
+                out.push(I::RefNull(HeapType::Concrete(rec_idx)));
+                out.push(I::Else);
+                out.push(I::LocalGet(src));
+                out.push(I::I32Const(0));
+                out.push(I::ArrayGet(arr_idx));
+                out.push(I::End);
+            }
+            other => return Err(unsupported(pos_of(other), "this Maybe expression")),
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1626,9 +1784,10 @@ impl<'a> Emitter<'a> {
         types.ty().function([ValType::I32, ValType::I32], []);
         types.ty().function([], []);
         types.ty().function([], [ValType::I32]);
-        types
-            .ty()
-            .function([ValType::I32, ValType::I32, ValType::I32], [ValType::I32]);
+        types.ty().function(
+            [ValType::I32, ValType::I32, ValType::I32, ValType::I32],
+            [ValType::I32],
+        );
         types.ty().function([ValType::I64], [str_val()]);
         types
             .ty()
@@ -1648,6 +1807,7 @@ impl<'a> Emitter<'a> {
         types
             .ty()
             .function([ValType::I32, ValType::F64], [ValType::I32]);
+        types.ty().function([str_val()], [ValType::I64]);
         module.section(&types);
 
         // Functions.
@@ -1661,6 +1821,7 @@ impl<'a> Emitter<'a> {
             self.t_concat_str(),
             self.t_streq(),
             self.t_wstrgc(),
+            self.t_atoi(),
         ] {
             funcs.function(ty);
         }
@@ -1782,6 +1943,7 @@ impl<'a> Emitter<'a> {
             self.fn_concat_str(),
             self.fn_streq(),
             self.fn_wstrgc(),
+            self.fn_atoi(),
         ];
         for i in 0..self.records.len() {
             bodies.push(self.fn_arrcat(i));
@@ -2154,6 +2316,102 @@ impl<'a> Emitter<'a> {
         f
     }
 
+    /// atoi(s) -> i64: whole-string decimal parse, 0 on any invalid input
+    /// (the language's `toInt` rule).
+    fn fn_atoi(&self) -> Function {
+        // params: 0 = s; locals: 1 = i (i32), 2 = len (i32), 3 = neg (i32),
+        // 4 = n (i64), 5 = c (i32)
+        let mut f = Function::new([(3, ValType::I32), (1, ValType::I64), (1, ValType::I32)]);
+        let mut ins: Vec<I<'static>> = Vec::new();
+        ins.extend([
+            I::LocalGet(0),
+            I::ArrayLen,
+            I::LocalSet(2),
+            // empty -> 0
+            I::LocalGet(2),
+            I::I32Eqz,
+            I::If(BlockType::Empty),
+            I::I64Const(0),
+            I::Return,
+            I::End,
+            // leading '-'
+            I::LocalGet(0),
+            I::I32Const(0),
+            I::ArrayGetU(T_STR),
+            I::I32Const(45),
+            I::I32Eq,
+            I::If(BlockType::Empty),
+            I::I32Const(1),
+            I::LocalSet(3),
+            I::I32Const(1),
+            I::LocalSet(1),
+            // bare "-" -> 0
+            I::LocalGet(2),
+            I::I32Const(1),
+            I::I32Eq,
+            I::If(BlockType::Empty),
+            I::I64Const(0),
+            I::Return,
+            I::End,
+            I::End,
+            // digits
+            I::Block(BlockType::Empty),
+            I::Loop(BlockType::Empty),
+            I::LocalGet(1),
+            I::LocalGet(2),
+            I::I32GeU,
+            I::BrIf(1),
+            I::LocalGet(0),
+            I::LocalGet(1),
+            I::ArrayGetU(T_STR),
+            I::LocalSet(5),
+            I::LocalGet(5),
+            I::I32Const(48),
+            I::I32LtU,
+            I::If(BlockType::Empty),
+            I::I64Const(0),
+            I::Return,
+            I::End,
+            I::LocalGet(5),
+            I::I32Const(57),
+            I::I32GtU,
+            I::If(BlockType::Empty),
+            I::I64Const(0),
+            I::Return,
+            I::End,
+            I::LocalGet(4),
+            I::I64Const(10),
+            I::I64Mul,
+            I::LocalGet(5),
+            I::I32Const(48),
+            I::I32Sub,
+            I::I64ExtendI32U,
+            I::I64Add,
+            I::LocalSet(4),
+            I::LocalGet(1),
+            I::I32Const(1),
+            I::I32Add,
+            I::LocalSet(1),
+            I::Br(0),
+            I::End,
+            I::End,
+            // sign
+            I::LocalGet(3),
+            I::If(BlockType::Result(ValType::I64)),
+            I::I64Const(0),
+            I::LocalGet(4),
+            I::I64Sub,
+            I::Else,
+            I::LocalGet(4),
+            I::End,
+            I::End,
+        ]);
+        for i in &ins {
+            f.instruction(i);
+        }
+        f
+    }
+
     /// Per-record array concat: (a, b) -> new array.
     fn fn_arrcat(&self, rec: usize) -> Function {
         let arr = 1 + self.n_records() + rec as u32;
@@ -2365,6 +2623,7 @@ impl<'a> Emitter<'a> {
                 let slot = match self.msg_payload(k) {
                     Some(Ty::Str) => Slot::PayloadStr,
                     Some(Ty::Int) => Slot::PayloadInt,
+                    Some(Ty::Bool) => Slot::PayloadBool,
                     _ => unreachable!("gated payload types"),
                 };
                 ctx.env.push((v.clone(), slot));
@@ -2536,7 +2795,7 @@ impl<'a> Emitter<'a> {
                 )
             })
             .collect();
-        let mut ctx = Ctx::new(3);
+        let mut ctx = Ctx::new(4);
         let mut ins: Vec<I<'static>> = Vec::new();
         ins.push(I::I32Const(0));
         ins.push(I::GlobalSet(G_CURSOR));
@@ -2568,10 +2827,7 @@ impl<'a> Emitter<'a> {
             match kind {
                 HandlerKindOwned::Static { takes_input, arg } => {
                     if *takes_input {
-                        ins.push(I::I32Const(PAYLOAD_BUF));
-                        ins.push(I::LocalGet(2));
-                        ins.push(I::Call(F_MEM2STR));
-                        ins.push(I::GlobalSet(G_PAYLOAD));
+                        self.materialize_event_payload(*msg, &mut ins);
                     }
                     if let Some(arg) = arg {
                         self.emit_arg(arg, *msg, &mut ctx, &mut ins)?;
@@ -2620,10 +2876,7 @@ impl<'a> Emitter<'a> {
                     ins.push(I::ArrayGet(arr_idx));
                     ins.push(I::LocalSet(t));
                     if *takes_input {
-                        ins.push(I::I32Const(PAYLOAD_BUF));
-                        ins.push(I::LocalGet(2));
-                        ins.push(I::Call(F_MEM2STR));
-                        ins.push(I::GlobalSet(G_PAYLOAD));
+                        self.materialize_event_payload(*msg, &mut ins);
                     }
                     if let Some(arg) = arg {
                         ctx.env.push((var, Slot::Item(t, rec)));
@@ -2647,6 +2900,25 @@ impl<'a> Emitter<'a> {
         ins.push(I::GlobalGet(G_CURSOR));
         ins.push(I::End);
         Ok(ctx.into_function(&[], &ins))
+    }
+
+    /// Route the event payload into the right global by the message's
+    /// payload type: String from the staging buffer, Bool from dispatch's
+    /// `checked` parameter (param index 3).
+    fn materialize_event_payload(&self, msg: u32, ins: &mut Vec<I<'static>>) {
+        match self.msg_payload(msg) {
+            Some(Ty::Bool) => {
+                ins.push(I::LocalGet(3));
+                ins.push(I::I64ExtendI32U);
+                ins.push(I::GlobalSet(G_PAYLOAD_I64));
+            }
+            _ => {
+                ins.push(I::I32Const(PAYLOAD_BUF));
+                ins.push(I::LocalGet(2));
+                ins.push(I::Call(F_MEM2STR));
+                ins.push(I::GlobalSet(G_PAYLOAD));
+            }
+        }
     }
 
     /// Evaluate a handler's message argument into the right payload global.
@@ -3098,17 +3370,26 @@ view = div [] []
     }
 
     #[test]
-    fn bool_payloads_error_cleanly() {
-        let src = r#"
+    fn bool_payloads_emit_a_valid_module() {
+        assert_valid(
+            r#"
 app B
 model { on: Int }
 init = { on = 0 }
 msg Flip Bool
 update Flip b = { on = if b then 1 else 0 }
-view = div [] []
-"#;
-        let app = zumar_lang::compile(src).unwrap();
-        let err = emit(&app).unwrap_err();
-        assert!(err.contains("not yet in the wasmgc backend"), "{err}");
+view = div [] [ input [type "checkbox", onCheck Flip] [] ]
+"#,
+        );
+    }
+
+    #[test]
+    fn queue_with_maybe_emits_a_valid_module() {
+        assert_valid(include_str!("../../../examples/lang-queue/queue.zu"));
+    }
+
+    #[test]
+    fn expenses_with_fold_and_atoi_emits_a_valid_module() {
+        assert_valid(include_str!("../../../examples/lang-expenses/expenses.zu"));
     }
 }

@@ -1,6 +1,6 @@
 # expenses.zu — the phase-2.1 dogfood.
-# Needs the new builtins: toInt (parse the amount field) and sum (total
-# over a comprehension). A numeric-input app, which v2.0 couldn't express.
+# toInt parses the amount field; fold totals the list. Runs on both
+# backends (fold inlines to a loop on GC; toInt gets an emitted atoi).
 
 app Expenses
 
@@ -33,7 +33,7 @@ view =
       input [type "text", placeholder "cents", value model.amount, onInput Amount] [],
       button [type "submit"] [ text "add" ]
     ],
-    div [class "total"] [ text (show(sum(for t in model.items yield t.cents)) ++ "¢ total") ],
+    div [class "total"] [ text (show(fold(model.items, 0, acc t -> acc + t.cents)) ++ "¢ total") ],
     ul [class "items"] [
       for t in model.items {
         li [key show(t.id)] [

@@ -87,6 +87,16 @@ pub enum Expr {
     RecordLit(Vec<(String, Expr, Pos)>, Pos),
     /// `{ base | field = e, ... }`
     RecordUpdate(Box<Expr>, Vec<(String, Expr, Pos)>, Pos),
+    /// `fold(<list>, <init>, <acc> <item> -> <body>)` — the lambda is
+    /// syntactic and always applied, so no first-class functions exist.
+    Fold {
+        list: Box<Expr>,
+        init: Box<Expr>,
+        acc: String,
+        item: String,
+        body: Box<Expr>,
+        pos: Pos,
+    },
     /// `for <var> in <list> [where <cond>] yield <body>` -> List
     For {
         var: String,

@@ -54,15 +54,18 @@ jobs:
           cd www && cp ../test.mjs . && node test.mjs
       - name: wasmgc backend (emit counter/hello/todo, run behavior harnesses)
         run: |
-          for app in counter hello todo clock kanban; do
+          for app in counter hello todo clock kanban queue expenses; do
             cargo run --release -p zumar-wasmgc --bin zuc-gc -- \
               examples/lang-$app/$app.zu -o spikes/wasmgc/$app-emitted.wasm
           done
+          cargo run --release -p zumar-wasmgc --bin zuc-gc -- \
+            spikes/wasmgc/toggle.zu -o spikes/wasmgc/toggle-emitted.wasm
           node spikes/wasmgc/run-emitted.mjs
           node spikes/wasmgc/run-hello.mjs
           node spikes/wasmgc/run-todo.mjs
           node spikes/wasmgc/run-clock.mjs
           node spikes/wasmgc/run-kanban.mjs
+          node spikes/wasmgc/run-remaining.mjs
       - name: zuc --backend gc (CLI path)
         run: |
           cargo run --release -p zumar-cli --bin zuc -- build \

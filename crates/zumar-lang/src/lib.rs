@@ -630,6 +630,38 @@ view = div [] []
     }
 
     #[test]
+    fn fold_lowers_on_the_rust_backend() {
+        let src = r#"
+app F
+record Item { id: Int, cents: Int }
+model { items: List Item }
+init = { items = [] }
+msg M
+update M = { items = [] }
+view = div [] [ text show(fold(model.items, 0, acc t -> acc + t.cents)) ]
+"#;
+        let rs = gen_rs(src);
+        assert!(rs.contains("let mut __f"), "{rs}");
+        assert!(rs.contains("for t in (model.items.clone()).iter()"), "{rs}");
+        assert!(rs.contains("let acc = __f"), "{rs}");
+    }
+
+    #[test]
+    fn fold_body_must_match_init_type() {
+        let src = r#"
+app F
+record Item { id: Int }
+model { items: List Item, n: Int }
+init = { items = [], n = 0 }
+msg M
+update M = { n = fold(model.items, 0, acc t -> "nope") }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("fold body"), "{err}");
+    }
+
+    #[test]
     fn pathological_nesting_errors_cleanly() {
         let bomb = format!(
             "app X\nmodel {{ a: Int }}\ninit = {{ a = {}1{} }}\nmsg M\nupdate M = {{ a = 1 }}\nview = div [] []",

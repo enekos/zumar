@@ -736,6 +736,22 @@ impl Checker {
                 }
                 Ok(bt)
             }
+            Expr::Fold {
+                list,
+                init,
+                acc,
+                item,
+                body,
+                pos,
+            } => {
+                let elem = self.list_elem(list, env, *pos)?;
+                let acc_ty = self.infer(init, expected, env)?;
+                let mut inner = env.clone();
+                inner.push((acc.clone(), acc_ty.clone()));
+                inner.push((item.clone(), elem));
+                self.expect(body, &acc_ty, &inner, "fold body")?;
+                Ok(acc_ty)
+            }
             Expr::For {
                 var,
                 list,
@@ -909,6 +925,7 @@ fn pos_of(expr: &Expr) -> Pos {
         | Expr::Some(_, p)
         | Expr::Ctor(_, _, p)
         | Expr::Case { pos: p, .. }
+        | Expr::Fold { pos: p, .. }
         | Expr::Reverse(_, p)
         | Expr::Not(_, p)
         | Expr::Bin(_, _, _, p)

@@ -94,8 +94,10 @@ See `examples/lang-todo/todo.zu` for the whole thing.
 serves, watches and live-reloads.
 
 List helpers: `length`, `sum` (over a `List Int`), `reverse`, `nth(list, i,
-default)`, and `head(list) -> Maybe T`. `toInt(s)` parses a `String` to
-`Int` (0 on failure), which is what makes numeric text inputs work — see
+default)`, `head(list) -> Maybe T`, and
+`fold(list, init, acc x -> expr)` — the lambda is syntactic and always
+applied, so the language stays first-order and the GC backend inlines it
+to a loop. `toInt(s)` parses a `String` to `Int` (0 on failure) — see
 `examples/lang-expenses`.
 
 `Maybe T` is a built-in optional (Rust `Option` under the hood), built with
@@ -151,8 +153,9 @@ GC) — see `examples/lang-kanban`.
 
 ### Not there yet
 
-Enum payload variants don't reach the GC backend yet, and there are no
-`fold`/lambdas.
+Enum payload variants and nested `for` don't reach the GC backend yet
+(clean errors point back to the Rust backend), and there are no
+general-purpose lambdas — `fold`'s arrow is the only one.
 
 ## The protocol
 
@@ -249,7 +252,9 @@ python3 -m http.server 8765 -d www
 9. ~~user-defined sum types + general pattern matching (`kanban.zu`, both
    backends)~~
 10. ~~`zuc dev --backend gc` — millisecond rebuilds~~
-11. next: `fold`/lambdas; GC gaps (`Maybe`, enum payloads, Bool payloads,
-    nested `for`).
+11. ~~`fold`; GC: `Maybe` (null-repr), Bool payloads, `toInt` — every demo
+    app now runs on both backends~~
+12. next: sutegi integration (full-stack story); GC gaps (enum payloads,
+    nested `for`, helper tree-shake).
 
 MIT.
