@@ -367,7 +367,7 @@ impl<'a> Emitter<'a> {
         }
         if let Some(subs) = &app.subs {
             let mut conds = Vec::new();
-            e.collect_sub_sites(subs, &mut conds);
+            e.collect_sub_sites(subs, &mut conds)?;
         }
         Ok(e)
     }
@@ -388,6 +388,12 @@ impl<'a> Emitter<'a> {
                     ctor: self.msg_index(ctor),
                 })
             }
+            // pubsub is a live-mode (server) effect; the WasmGC client
+            // backend has no bus to publish to.
+            CmdCall::Publish { pos, .. } => Err(unsupported(
+                *pos,
+                "publish (live mode only; use --target live)",
+            )),
         }
     }
 
@@ -395,30 +401,41 @@ impl<'a> Emitter<'a> {
         &mut self,
         subs: &zumar_lang::ast::SubExpr,
         conds: &mut Vec<(Expr, bool)>,
-    ) {
-        use zumar_lang::ast::SubExpr;
+    ) -> Result<(), String> {
+        use zumar_lang::ast::{SubCall, SubExpr};
         match subs {
             SubExpr::List(calls) => {
                 for c in calls {
-                    let msg = self.msg_index(&c.msg);
-                    let clocked = self.app.msgs[msg as usize].payload.is_some();
-                    self.sub_sites.push(SubSite {
-                        ms: c.ms,
-                        msg,
-                        clocked,
-                        conds: conds.clone(),
-                    });
+                    match c {
+                        SubCall::Every { ms, msg, .. } => {
+                            let msg = self.msg_index(msg);
+                            let clocked = self.app.msgs[msg as usize].payload.is_some();
+                            self.sub_sites.push(SubSite {
+                                ms: *ms,
+                                msg,
+                                clocked,
+                                conds: conds.clone(),
+                            });
+                        }
+                        SubCall::Topic { pos, .. } => {
+                            return Err(unsupported(
+                                *pos,
+                                "topic subscriptions (live mode only; use --target live)",
+                            ));
+                        }
+                    }
                 }
             }
             SubExpr::If(cond, t, f, _) => {
                 conds.push((cond.clone(), true));
-                self.collect_sub_sites(t, conds);
+                self.collect_sub_sites(t, conds)?;
                 conds.pop();
                 conds.push((cond.clone(), false));
-                self.collect_sub_sites(f, conds);
+                self.collect_sub_sites(f, conds)?;
                 conds.pop();
             }
         }
+        Ok(())
     }
 
     // --- type & function index layout ---------------------------------------

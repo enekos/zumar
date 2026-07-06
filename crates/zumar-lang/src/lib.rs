@@ -203,6 +203,46 @@ view =
     }
 
     #[test]
+    fn topic_sub_and_publish_cmd_lower_to_runtime_calls() {
+        let src = r#"
+app Chat
+model { draft: String, last: String }
+init = { draft = "", last = "" }
+msg Draft String | Send | Got String
+update Draft s = { draft = s }
+update Send = { draft = "" } then publish("room", model.draft)
+update Got s = { last = s }
+sub = [ topic("room", Got) ]
+view = div [] [ input [value model.draft, onInput Draft] [], button [onClick Send] [ text "send" ] ]
+"#;
+        let rs = gen_rs(src);
+        assert!(
+            rs.contains("zumar_runtime::publish(\"room\".to_string(), model.draft.clone())"),
+            "{rs}"
+        );
+        assert!(
+            rs.contains("zumar_runtime::topic(\"room\".to_string(), __topic_got)"),
+            "{rs}"
+        );
+        assert!(rs.contains("fn __topic_got(msg: String) -> Msg {"), "{rs}");
+    }
+
+    #[test]
+    fn topic_ctor_must_take_a_string() {
+        let src = r#"
+app X
+model { n: Int }
+init = { n = 0 }
+msg Tick
+update Tick = { n = model.n + 1 }
+sub = [ topic("room", Tick) ]
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("must take a String payload"), "{err}");
+    }
+
+    #[test]
     fn input_and_submit_events_lower_to_runtime_calls() {
         let src = r#"
 app F
@@ -488,8 +528,10 @@ view =
         let rs = gen_rs(CLOCK);
         for needle in [
             // commands from update arms + init
-            "return vec![zumar_runtime::http_get(\"./quote.txt\".to_string(), __http_got)];",
-            "return vec![zumar_runtime::delay(1500, Msg::Pong)];",
+            // cmds bind before the field assignments (pre-update model), then return
+            "let __cmds = vec![zumar_runtime::http_get(\"./quote.txt\".to_string(), __http_got)];",
+            "let __cmds = vec![zumar_runtime::delay(1500, Msg::Pong)];",
+            "return __cmds;",
             ".with_init(vec![zumar_runtime::http_get(",
             // http callback fn: body on ok, error text otherwise
             "fn __http_got(r: zumar_runtime::effects::HttpResult) -> Msg {",

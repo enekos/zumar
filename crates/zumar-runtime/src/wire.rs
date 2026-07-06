@@ -25,9 +25,10 @@
 //!        | 6 path idx:varint node    (insertChild)
 //!        | 7 path from:varint to:varint  (moveChild)
 //! events = n:(str pd:u8)*n
-//! cmds   = n:(id:varint spec)*n ; spec = 0 ms:varint | 1 str
+//! cmds   = n:(id:varint spec)*n ; spec = 0 ms:varint (delay) | 1 str (httpGet)
+//!        | 2 str str (publish: topic, message)
 //! subs   = n:delta*n ; delta = 0 id:varint spec | 1 id:varint
-//!        ; sub spec = 0 ms:varint    (every)
+//!        ; sub spec = 0 ms:varint (every) | 1 str (topic name)
 //! ```
 
 use zumar_core::{EventSpec, Patch, SerNode};
@@ -185,6 +186,11 @@ fn tail(buf: &mut Vec<u8>, events: &[EventSpec], cmds: &[CmdOut], subs: &[SubDel
                 buf.push(1);
                 s(buf, url);
             }
+            CmdSpec::Publish { topic, message } => {
+                buf.push(2);
+                s(buf, topic);
+                s(buf, message);
+            }
         }
     }
     vu(buf, subs.len() as u64);
@@ -197,6 +203,10 @@ fn tail(buf: &mut Vec<u8>, events: &[EventSpec], cmds: &[CmdOut], subs: &[SubDel
                     SubSpec::Every { ms } => {
                         buf.push(0);
                         vu(buf, *ms as u64);
+                    }
+                    SubSpec::Topic { name } => {
+                        buf.push(1);
+                        s(buf, name);
                     }
                 }
             }

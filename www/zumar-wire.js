@@ -75,11 +75,15 @@ class Reader {
     const kind = this.u8();
     if (kind === 0) return { kind: "delay", ms: this.vu() };
     if (kind === 1) return { kind: "httpGet", url: this.str() };
+    // publish is live-mode only; a client build decodes it but the shim
+    // drops it (no server bus) — see zumar.js.
+    if (kind === 2) return { kind: "publish", topic: this.str(), message: this.str() };
     throw new Error(`zumar-wire: unknown cmd kind ${kind}`);
   }
   subSpec() {
     const kind = this.u8();
     if (kind === 0) return { kind: "every", ms: this.vu() };
+    if (kind === 1) return { kind: "topic", name: this.str() };
     throw new Error(`zumar-wire: unknown sub kind ${kind}`);
   }
   tail(out) {

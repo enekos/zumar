@@ -131,15 +131,24 @@ pub enum CmdCall {
     /// `httpGet(url, Ctor)` — Ctor takes a String: the body on success,
     /// `"error <status>"` on failure.
     HttpGet { url: Expr, ctor: String, pos: Pos },
+    /// `publish(topic, message)` — fire-and-forget fan-out to a pubsub topic
+    /// (both String). Live-mode only. The pair of a `topic(...)` sub.
+    Publish {
+        topic: Expr,
+        message: Expr,
+        pos: Pos,
+    },
 }
 
-/// `every(ms, Msg)` — Msg payload-less, or `Msg Int` to receive the
-/// shim's clock (ms since epoch).
+/// One subscription in a `sub = [...]` list.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SubCall {
-    pub ms: i64,
-    pub msg: String,
-    pub pos: Pos,
+pub enum SubCall {
+    /// `every(ms, Msg)` — Msg payload-less, or `Msg Int` for the shim's
+    /// clock (ms since epoch).
+    Every { ms: i64, msg: String, pos: Pos },
+    /// `topic(name, Ctor)` — subscribe to a pubsub topic; each published
+    /// message fires `Ctor` with the message String. Live-mode only.
+    Topic { name: Expr, ctor: String, pos: Pos },
 }
 
 /// The `sub = ...` declaration: a list of subscriptions, possibly chosen

@@ -25,7 +25,7 @@ use zumar_core::{
     collect_events, diff, find_listener, EventPayload, EventSpec, Patch, SerNode, VNode,
 };
 
-pub use effects::{delay, every, every_with_now, http_get};
+pub use effects::{delay, every, every_with_now, http_get, publish, topic};
 use effects::{
     Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta, SubSpec,
 };
@@ -257,6 +257,9 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
                 status: payload.status.unwrap_or(0),
                 body: payload.body.clone().unwrap_or_default(),
             }),
+            // Fire callbacks are never inserted into `pending`, so this is
+            // unreachable — but keep the match total rather than panic.
+            CmdCallback::Fire => return Update::noop(),
         };
         self.step(msg)
     }
@@ -270,6 +273,7 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
         let msg = match &active.callback {
             SubCallback::Simple(m) => m.clone(),
             SubCallback::WithNow(f) => f(payload.now.unwrap_or(0.0)),
+            SubCallback::WithBody(f) => f(payload.body.clone().unwrap_or_default()),
         };
         self.step(msg)
     }
@@ -297,7 +301,11 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
         cmds.into_iter()
             .map(|Cmd { spec, callback }| {
                 let id = self.fresh_id();
-                self.pending.insert(id, callback);
+                // Fire-and-forget commands (publish) never resolve, so they
+                // get an id + spec for the executor but no pending entry.
+                if !matches!(callback, CmdCallback::Fire) {
+                    self.pending.insert(id, callback);
+                }
                 CmdOut { id, spec }
             })
             .collect()
@@ -536,6 +544,91 @@ mod tests {
 
     fn fx_program() -> Program<FxModel, FxMsg> {
         Program::new(FxModel::default(), fx_update, fx_view).with_subscriptions(fx_subs)
+    }
+
+    #[test]
+    fn topic_sub_and_publish_cmd() {
+        use effects::{publish, topic};
+
+        #[derive(Clone)]
+        enum M {
+            Send,
+            Got(String),
+        }
+        #[derive(Default)]
+        struct Room {
+            joined: bool,
+            last: String,
+        }
+        fn update(m: &mut Room, msg: M) -> Cmds<M> {
+            match msg {
+                M::Send => {
+                    m.joined = true;
+                    return vec![publish("room", "hi")];
+                }
+                M::Got(s) => m.last = s,
+            }
+            Vec::new()
+        }
+        fn view(m: &Room) -> VNode<M> {
+            el("div")
+                .child(el("button").on("click", M::Send).text("send"))
+                .child(el("span").text(m.last.clone()))
+                .into()
+        }
+        fn subs(m: &Room) -> Vec<effects::Sub<M>> {
+            if m.joined {
+                vec![topic("room", M::Got)]
+            } else {
+                Vec::new()
+            }
+        }
+
+        let mut p = Program::new(Room::default(), update, view).with_subscriptions(subs);
+        p.initial_render();
+
+        // Clicking send: a fire-and-forget publish cmd + a Topic sub Start.
+        let sent = p.dispatch(&[0], "click", &EventPayload::default());
+        assert_eq!(
+            sent.cmds[0].spec,
+            effects::CmdSpec::Publish {
+                topic: "room".into(),
+                message: "hi".into()
+            }
+        );
+        let SubDelta::Start { id, ref spec } = sent.subs[0] else {
+            panic!("expected Topic sub start, got {:?}", sent.subs)
+        };
+        assert_eq!(
+            *spec,
+            effects::SubSpec::Topic {
+                name: "room".into()
+            }
+        );
+
+        // A publish cmd is fire-and-forget: resolving its id is a no-op (it
+        // was never tracked), so it can't accidentally re-enter the program.
+        assert!(p
+            .resolve(sent.cmds[0].id, &FxPayload::default())
+            .patches
+            .is_empty());
+
+        // The topic fires with the published message as the body.
+        let got = p.notify(
+            id,
+            &FxPayload {
+                body: Some("hello room".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(p.model().last, "hello room");
+        assert_eq!(
+            got.patches,
+            vec![Patch::SetText {
+                path: vec![1, 0],
+                text: "hello room".into()
+            }]
+        );
     }
 
     #[test]

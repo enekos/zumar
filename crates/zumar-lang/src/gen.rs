@@ -227,14 +227,21 @@ impl Gen {
                     rust_ty(&want)
                 ));
             }
+            // Commands see the *pre-update* model, same as the field RHS: the
+            // whole arm is one atomic transform of (model, cmds) from the old
+            // model. So `{ draft = "" } then publish(.., model.draft)` still
+            // publishes the draft it just cleared. Bind before assigning.
+            if !u.cmds.is_empty() {
+                o.push_str(&format!(
+                    "            let __cmds = vec![{}];\n",
+                    self.emit_cmds(&u.cmds, &env)
+                ));
+            }
             for (name, _, _) in &u.fields {
                 o.push_str(&format!("            model.{name} = __new_{name};\n"));
             }
             if !u.cmds.is_empty() {
-                o.push_str(&format!(
-                    "            return vec![{}];\n",
-                    self.emit_cmds(&u.cmds, &env)
-                ));
+                o.push_str("            return __cmds;\n");
             }
             o.push_str("        }\n");
         }
@@ -251,6 +258,12 @@ impl Gen {
         for ctor in self.clocked_sub_ctors(app) {
             o.push_str(&format!(
                 "fn __tick_{lc}(now: f64) -> Msg {{\n    Msg::{ctor}(now as i64)\n}}\n\n",
+                lc = ctor.to_lowercase(),
+            ));
+        }
+        for ctor in self.topic_ctors(app) {
+            o.push_str(&format!(
+                "fn __topic_{lc}(msg: String) -> Msg {{\n    Msg::{ctor}(msg)\n}}\n\n",
                 lc = ctor.to_lowercase(),
             ));
         }
@@ -317,12 +330,14 @@ impl Gen {
             match subs {
                 SubExpr::List(calls) => {
                     for c in calls {
-                        let clocked = app
-                            .msgs
-                            .iter()
-                            .any(|m| m.name == c.msg && m.payload.is_some());
-                        if clocked && !out.contains(&c.msg) {
-                            out.push(c.msg.clone());
+                        if let SubCall::Every { msg, .. } = c {
+                            let clocked = app
+                                .msgs
+                                .iter()
+                                .any(|m| &m.name == msg && m.payload.is_some());
+                            if clocked && !out.contains(msg) {
+                                out.push(msg.clone());
+                            }
                         }
                     }
                 }
@@ -334,6 +349,33 @@ impl Gen {
         }
         if let Some(subs) = &app.subs {
             walk(subs, app, &mut ctors);
+        }
+        ctors
+    }
+
+    /// Constructors reached by a `topic(name, Ctor)` sub — each needs a named
+    /// `fn(String) -> Msg` (the runtime takes fn pointers, not closures).
+    fn topic_ctors(&self, app: &App) -> Vec<String> {
+        let mut ctors = Vec::new();
+        fn walk(subs: &SubExpr, out: &mut Vec<String>) {
+            match subs {
+                SubExpr::List(calls) => {
+                    for c in calls {
+                        if let SubCall::Topic { ctor, .. } = c {
+                            if !out.contains(ctor) {
+                                out.push(ctor.clone());
+                            }
+                        }
+                    }
+                }
+                SubExpr::If(_, t, f, _) => {
+                    walk(t, out);
+                    walk(f, out);
+                }
+            }
+        }
+        if let Some(subs) = &app.subs {
+            walk(subs, &mut ctors);
         }
         ctors
     }
@@ -351,6 +393,11 @@ impl Gen {
                         ctor.to_lowercase()
                     )
                 }
+                CmdCall::Publish { topic, message, .. } => {
+                    let (t, _) = self.emit(topic, Some(&Ty::Str), env);
+                    let (m, _) = self.emit(message, Some(&Ty::Str), env);
+                    format!("zumar_runtime::publish({t}, {m})")
+                }
             })
             .collect::<Vec<_>>()
             .join(", ")
@@ -361,19 +408,24 @@ impl Gen {
             SubExpr::List(calls) => {
                 let items: Vec<String> = calls
                     .iter()
-                    .map(|c| {
-                        let clocked = app
-                            .msgs
-                            .iter()
-                            .any(|m| m.name == c.msg && m.payload.is_some());
-                        if clocked {
-                            format!(
-                                "zumar_runtime::every_with_now({}, __tick_{})",
-                                c.ms,
-                                c.msg.to_lowercase()
-                            )
-                        } else {
-                            format!("zumar_runtime::every({}, Msg::{})", c.ms, c.msg)
+                    .map(|c| match c {
+                        SubCall::Every { ms, msg, .. } => {
+                            let clocked = app
+                                .msgs
+                                .iter()
+                                .any(|m| &m.name == msg && m.payload.is_some());
+                            if clocked {
+                                format!(
+                                    "zumar_runtime::every_with_now({ms}, __tick_{})",
+                                    msg.to_lowercase()
+                                )
+                            } else {
+                                format!("zumar_runtime::every({ms}, Msg::{msg})")
+                            }
+                        }
+                        SubCall::Topic { name, ctor, .. } => {
+                            let (n, _) = self.emit(name, Some(&Ty::Str), env);
+                            format!("zumar_runtime::topic({n}, __topic_{})", ctor.to_lowercase())
                         }
                     })
                     .collect();

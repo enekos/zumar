@@ -418,7 +418,7 @@ impl Parser {
     }
 
     fn cmd_call(&mut self) -> Result<CmdCall, ZuError> {
-        let (name, pos) = self.ident("a command (delay, httpGet)")?;
+        let (name, pos) = self.ident("a command (delay, httpGet, publish)")?;
         match name.as_str() {
             "delay" => {
                 self.expect(Tok::LParen)?;
@@ -436,9 +436,21 @@ impl Parser {
                 self.expect(Tok::RParen)?;
                 Ok(CmdCall::HttpGet { url, ctor, pos })
             }
+            "publish" => {
+                self.expect(Tok::LParen)?;
+                let topic = self.expr()?;
+                self.expect(Tok::Comma)?;
+                let message = self.expr()?;
+                self.expect(Tok::RParen)?;
+                Ok(CmdCall::Publish {
+                    topic,
+                    message,
+                    pos,
+                })
+            }
             other => Err(ZuError::at(
                 pos,
-                format!("unknown command `{other}` (available: delay, httpGet)"),
+                format!("unknown command `{other}` (available: delay, httpGet, publish)"),
             )),
         }
     }
@@ -463,19 +475,35 @@ impl Parser {
         let mut calls = Vec::new();
         if self.peek().tok != Tok::RBracket {
             loop {
-                let (name, pos) = self.ident("a subscription (every)")?;
-                if name != "every" {
-                    return Err(ZuError::at(
-                        pos,
-                        format!("unknown subscription `{name}` (available: every)"),
-                    ));
+                let (name, pos) = self.ident("a subscription (every, topic)")?;
+                match name.as_str() {
+                    "every" => {
+                        self.expect(Tok::LParen)?;
+                        let ms = self.int_lit("interval milliseconds")?;
+                        self.expect(Tok::Comma)?;
+                        let (msg, _) = self.ident("message name")?;
+                        self.expect(Tok::RParen)?;
+                        calls.push(SubCall::Every { ms, msg, pos });
+                    }
+                    "topic" => {
+                        self.expect(Tok::LParen)?;
+                        let topic_name = self.expr()?;
+                        self.expect(Tok::Comma)?;
+                        let (ctor, _) = self.ident("message constructor")?;
+                        self.expect(Tok::RParen)?;
+                        calls.push(SubCall::Topic {
+                            name: topic_name,
+                            ctor,
+                            pos,
+                        });
+                    }
+                    other => {
+                        return Err(ZuError::at(
+                            pos,
+                            format!("unknown subscription `{other}` (available: every, topic)"),
+                        ))
+                    }
                 }
-                self.expect(Tok::LParen)?;
-                let ms = self.int_lit("interval milliseconds")?;
-                self.expect(Tok::Comma)?;
-                let (msg, _) = self.ident("message name")?;
-                self.expect(Tok::RParen)?;
-                calls.push(SubCall { ms, msg, pos });
                 if self.peek().tok != Tok::Comma {
                     break;
                 }

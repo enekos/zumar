@@ -24,8 +24,19 @@ pub type Cmds<Msg> = Vec<Cmd<Msg>>;
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "camelCase"))]
 pub enum CmdSpec {
-    Delay { ms: u32 },
-    HttpGet { url: String },
+    Delay {
+        ms: u32,
+    },
+    HttpGet {
+        url: String,
+    },
+    /// Publish `message` to a pubsub `topic`. Fire-and-forget: no completion
+    /// re-enters the program. Only a live-mode host (sutegi-zumar) can act
+    /// on it; in client mode the shim warns and drops it (no server bus).
+    Publish {
+        topic: String,
+        message: String,
+    },
 }
 
 #[allow(unpredictable_function_pointer_comparisons)] // test-only equality, like Handler
@@ -33,6 +44,9 @@ pub enum CmdSpec {
 pub(crate) enum CmdCallback<Msg> {
     Simple(Msg),
     WithHttp(fn(HttpResult) -> Msg),
+    /// Fire-and-forget (publish): never resolves, so it is not tracked in the
+    /// pending table — no follow-up Msg, no leak.
+    Fire,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +86,19 @@ pub fn http_get<Msg>(url: impl Into<String>, f: fn(HttpResult) -> Msg) -> Cmd<Ms
     }
 }
 
+/// Publish `message` to `topic`. Fire-and-forget — the pair of [`topic`]:
+/// one connection publishes, every connection subscribed to that topic gets
+/// a message. Live-mode only (needs a server-side bus).
+pub fn publish<Msg>(topic: impl Into<String>, message: impl Into<String>) -> Cmd<Msg> {
+    Cmd {
+        spec: CmdSpec::Publish {
+            topic: topic.into(),
+            message: message.into(),
+        },
+        callback: CmdCallback::Fire,
+    }
+}
+
 /// A long-lived effect derived from model state. `subscriptions(&model)` is
 /// recomputed after every update and diffed against the active set — subs
 /// that appear start, subs that disappear stop, exactly like event specs.
@@ -84,7 +111,15 @@ pub struct Sub<Msg> {
 #[cfg_attr(feature = "serde", derive(Serialize))]
 #[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "camelCase"))]
 pub enum SubSpec {
-    Every { ms: u32 },
+    Every {
+        ms: u32,
+    },
+    /// Subscribe to a pubsub `topic`; each published message fires the sub
+    /// with that message as the payload. Live-mode only (needs a server bus)
+    /// — the pair of [`publish`].
+    Topic {
+        name: String,
+    },
 }
 
 impl SubSpec {
@@ -94,6 +129,7 @@ impl SubSpec {
     pub(crate) fn key(&self) -> String {
         match self {
             SubSpec::Every { ms } => format!("every:{ms}"),
+            SubSpec::Topic { name } => format!("topic:{name}"),
         }
     }
 }
@@ -103,6 +139,8 @@ impl SubSpec {
 pub(crate) enum SubCallback<Msg> {
     Simple(Msg),
     WithNow(fn(f64) -> Msg),
+    /// Deliver the fired payload string (a published topic message) to `f`.
+    WithBody(fn(String) -> Msg),
 }
 
 /// Fire `msg` every `ms` milliseconds while the sub is active.
@@ -118,6 +156,15 @@ pub fn every_with_now<Msg>(ms: u32, f: fn(f64) -> Msg) -> Sub<Msg> {
     Sub {
         spec: SubSpec::Every { ms },
         callback: SubCallback::WithNow(f),
+    }
+}
+
+/// Subscribe to `topic`; each message published there arrives through `f`.
+/// The pair of [`publish`]. Live-mode only.
+pub fn topic<Msg>(name: impl Into<String>, f: fn(String) -> Msg) -> Sub<Msg> {
+    Sub {
+        spec: SubSpec::Topic { name: name.into() },
+        callback: SubCallback::WithBody(f),
     }
 }
 

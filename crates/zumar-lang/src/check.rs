@@ -314,6 +314,11 @@ impl Checker {
                     )),
                 }
             }
+            CmdCall::Publish { topic, message, .. } => {
+                self.expect(topic, &Ty::Str, env, "publish topic")?;
+                self.expect(message, &Ty::Str, env, "publish message")?;
+                Ok(())
+            }
         }
     }
 
@@ -321,19 +326,39 @@ impl Checker {
         match subs {
             SubExpr::List(calls) => {
                 for c in calls {
-                    match self.msgs.get(&c.msg) {
-                        None => {
-                            return Err(ZuError::at(
-                                c.pos,
-                                format!("`{}` is not a declared message", c.msg),
-                            ))
-                        }
-                        Some(None) | Some(Some(Ty::Int)) => {}
-                        Some(Some(t)) => {
-                            return Err(ZuError::at(
-                                c.pos,
-                                format!("every fires `{}` with no payload or the clock (Int ms), but `{}` takes a {t}", c.msg, c.msg),
-                            ))
+                    match c {
+                        SubCall::Every { msg, pos, .. } => match self.msgs.get(msg) {
+                            None => {
+                                return Err(ZuError::at(
+                                    *pos,
+                                    format!("`{msg}` is not a declared message"),
+                                ))
+                            }
+                            Some(None) | Some(Some(Ty::Int)) => {}
+                            Some(Some(t)) => {
+                                return Err(ZuError::at(
+                                    *pos,
+                                    format!("every fires `{msg}` with no payload or the clock (Int ms), but `{msg}` takes a {t}"),
+                                ))
+                            }
+                        },
+                        SubCall::Topic { name, ctor, pos } => {
+                            self.expect(name, &Ty::Str, env, "topic name")?;
+                            match self.msgs.get(ctor) {
+                                None => {
+                                    return Err(ZuError::at(
+                                        *pos,
+                                        format!("`{ctor}` is not a declared message"),
+                                    ))
+                                }
+                                Some(Some(Ty::Str)) => {}
+                                Some(_) => {
+                                    return Err(ZuError::at(
+                                        *pos,
+                                        format!("topic delivers a String to `{ctor}`, so `{ctor}` must take a String payload"),
+                                    ))
+                                }
+                            }
                         }
                     }
                 }
