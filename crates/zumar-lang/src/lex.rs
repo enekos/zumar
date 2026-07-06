@@ -15,6 +15,7 @@ pub enum Tok {
     Colon,
     Eq,   // =
     EqEq, // ==
+    Ne,   // !=
     Pipe,
     Dot,
     Plus,
@@ -47,6 +48,7 @@ impl std::fmt::Display for Tok {
                     Tok::Colon => ":",
                     Tok::Eq => "=",
                     Tok::EqEq => "==",
+                    Tok::Ne => "!=",
                     Tok::Pipe => "|",
                     Tok::Dot => ".",
                     Tok::Plus => "+",
@@ -149,6 +151,20 @@ pub fn lex(src: &str) -> Result<Vec<Token>, ZuError> {
                     push!(Tok::PlusPlus, pos);
                 } else {
                     push!(Tok::Plus, pos);
+                }
+            }
+            '!' => {
+                chars.next();
+                col += 1;
+                if chars.peek() == Some(&'=') {
+                    chars.next();
+                    col += 1;
+                    push!(Tok::Ne, pos);
+                } else {
+                    return Err(ZuError::at(
+                        pos,
+                        "unexpected `!` (did you mean `!=`, or `not`?)",
+                    ));
                 }
             }
             '"' => {

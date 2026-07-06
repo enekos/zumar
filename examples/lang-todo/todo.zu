@@ -1,0 +1,56 @@
+# todo.zu — the phase-2 forcing function.
+# Exercises everything v0 couldn't: record types, List, message payloads,
+# input/submit events, list rendering, and list comprehensions in updates.
+#
+# Compile: zuc build todo.zu --out app  (then wasm-pack), or just `zuc dev`.
+
+app Todo
+
+record Item { id: Int, text: String, done: Bool }
+
+model { draft: String, items: List Item, seq: Int }
+
+init = { draft = "", items = [], seq = 1 }
+
+msg Draft String | Add | Toggle Int | Delete Int | Reverse
+
+update Draft s = { draft = s }
+
+update Add = {
+  items = model.items ++ [{ id = model.seq, text = model.draft, done = false }],
+  seq = model.seq + 1,
+  draft = ""
+}
+
+update Toggle id = {
+  items = for t in model.items yield (if t.id == id then { t | done = not t.done } else t)
+}
+
+update Delete id = {
+  items = for t in model.items where t.id != id yield t
+}
+
+update Reverse = { items = reverse(model.items) }
+
+view =
+  div [class "todo"] [
+    h1 [] [ text "zumar todo" ],
+    p [class "sub"] [ text "compiled from todo.zu" ],
+    form [onSubmit Add] [
+      input [type "text", placeholder "what needs doing?", value model.draft, onInput Draft] [],
+      button [type "submit"] [ text "add" ]
+    ],
+    div [class "bar"] [
+      span [] [ text (show(length(for t in model.items where not t.done yield t)) ++ " open") ],
+      button [onClick Reverse] [ text "reverse" ]
+    ],
+    ul [class "items"] [
+      for t in model.items {
+        li [key show(t.id), class (if t.done then "done" else "open")] [
+          span [class "check", onClick Toggle(t.id)] [ text (if t.done then "[x]" else "[ ]") ],
+          span [class "label"] [ text t.text ],
+          button [class "del", onClick Delete(t.id)] [ text "x" ]
+        ]
+      }
+    ]
+  ]

@@ -64,9 +64,9 @@ fn run(args: &[String]) -> Result<String, String> {
         Some("build") => {
             let file = args.get(1).ok_or(USAGE)?;
             let out = flag(args, "--out").ok_or(USAGE)?;
-            let zumar = zumar_path(args)?;
+            let deps = deps_fragment(zumar_path(args)?.as_deref());
             let (app, _) = compile_file(file)?;
-            let generated = write_crate(&app, Path::new(&out), &zumar)?;
+            let generated = write_crate(&app, Path::new(&out), &deps)?;
             Ok(format!(
                 "{file}: compiled app {} -> {out}/ (crate `{}`)\nnext: zuc dev, or wasm-pack build {out} --target web",
                 app.name, generated
@@ -84,11 +84,35 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .and_then(|i| args.get(i + 1).cloned())
 }
 
-fn zumar_path(args: &[String]) -> Result<PathBuf, String> {
-    let raw = flag(args, "--zumar")
-        .or_else(|| std::env::var("ZUMAR_HOME").ok())
-        .ok_or("can't locate the zumar repo: pass --zumar <path> or set ZUMAR_HOME")?;
-    std::fs::canonicalize(&raw).map_err(|e| format!("--zumar path `{raw}`: {e}"))
+/// The local zumar checkout, if `--zumar`/`ZUMAR_HOME` names one. Absent is
+/// fine: generated crates then depend on zumar over git instead.
+fn zumar_path(args: &[String]) -> Result<Option<PathBuf>, String> {
+    match flag(args, "--zumar").or_else(|| std::env::var("ZUMAR_HOME").ok()) {
+        Some(raw) => std::fs::canonicalize(&raw)
+            .map(Some)
+            .map_err(|e| format!("--zumar path `{raw}`: {e}")),
+        None => Ok(None),
+    }
+}
+
+const REPO: &str = "https://github.com/enekos/zumar";
+
+/// The `[dependencies]` lines for a generated crate: path deps against a
+/// local checkout when available (fast, offline), git deps otherwise so a
+/// scaffold is portable to anyone who has the repo URL.
+fn deps_fragment(zumar: Option<&Path>) -> String {
+    match zumar {
+        Some(p) => {
+            let root = p.display();
+            format!(
+                "zumar-core = {{ path = \"{root}/crates/zumar-core\" }}\n\
+                 zumar-runtime = {{ path = \"{root}/crates/zumar-runtime\" }}"
+            )
+        }
+        None => {
+            format!("zumar-core = {{ git = \"{REPO}\" }}\nzumar-runtime = {{ git = \"{REPO}\" }}")
+        }
+    }
 }
 
 // --- compilation with caret diagnostics ----------------------------------
@@ -115,8 +139,8 @@ fn report(file: &str, src: &str, e: &ZuError) -> String {
     out.trim_end().to_string()
 }
 
-fn write_crate(app: &zumar_lang::App, out: &Path, zumar: &Path) -> Result<String, String> {
-    let generated = zumar_lang::gen::generate(app, &zumar.display().to_string());
+fn write_crate(app: &zumar_lang::App, out: &Path, deps: &str) -> Result<String, String> {
+    let generated = zumar_lang::gen::generate(app, deps);
     let src_dir = out.join("src");
     std::fs::create_dir_all(&src_dir).map_err(|e| format!("{}: {e}", src_dir.display()))?;
     std::fs::write(out.join("Cargo.toml"), &generated.cargo_toml).map_err(|e| e.to_string())?;
@@ -239,7 +263,7 @@ fn dev(args: &[String]) -> Result<String, String> {
             .map_err(|_| format!("--port `{p}` is not a number"))?,
         None => 8900,
     };
-    let zumar = zumar_path(args)?;
+    let deps = deps_fragment(zumar_path(args)?.as_deref());
     let proj = std::fs::canonicalize(&file)
         .map_err(|e| format!("{file}: {e}"))?
         .parent()
@@ -254,7 +278,7 @@ fn dev(args: &[String]) -> Result<String, String> {
     }
 
     // First build must succeed so there is something to serve.
-    build_wasm(&file, &proj, &zumar)?;
+    build_wasm(&file, &proj, &deps)?;
 
     let counter = Arc::new(AtomicU64::new(1));
     {
@@ -273,7 +297,7 @@ fn dev(args: &[String]) -> Result<String, String> {
         let z = mtime(Path::new(&file));
         if z != zu_stamp {
             zu_stamp = z;
-            match build_wasm(&file, &proj, &zumar) {
+            match build_wasm(&file, &proj, &deps) {
                 Ok(elapsed) => {
                     counter.fetch_add(1, Ordering::SeqCst);
                     println!("zuc dev: rebuilt in {elapsed:.1}s — reloading");
@@ -314,11 +338,11 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 
 /// Compile the .zu, regenerate the crate, run wasm-pack (dev profile).
 /// Returns elapsed seconds.
-fn build_wasm(file: &str, proj: &Path, zumar: &Path) -> Result<f64, String> {
+fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
     let started = std::time::Instant::now();
     let (app, _) = compile_file(file)?;
     let app_dir = proj.join("app");
-    write_crate(&app, &app_dir, zumar)?;
+    write_crate(&app, &app_dir, deps)?;
 
     let output = Command::new("wasm-pack")
         .args(["build", "--dev", "--target", "web", "--out-dir"])
