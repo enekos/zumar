@@ -46,6 +46,11 @@ jobs:
           cargo run --release -p zumar-lang --bin zuc -- build \
             examples/lang-counter/counter.zu --out /tmp/zu-app --zumar "$PWD"
           wasm-pack build /tmp/zu-app --target web --out-dir /tmp/zu-app/pkg --release
+      - name: wasmgc backend (emit counter.zu, run behavior harness)
+        run: |
+          cargo run --release -p zumar-wasmgc --bin zuc-gc -- \
+            examples/lang-counter/counter.zu -o spikes/wasmgc/counter-emitted.wasm
+          node spikes/wasmgc/run-emitted.mjs
       - name: wire smoke test through the wasm binary
         run: |
           cd examples/effects/www

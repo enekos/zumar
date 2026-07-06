@@ -1,66 +1,77 @@
-# WasmGC spike — findings
+# WasmGC backend — spike findings
 
-Ran a hand-written WasmGC module (`counter.wat`) whose state is a GC
-`struct` behind a typed global, serializing renders into linear memory.
-Decoded its output with the real `www/zumar-wire.js`. It passes.
+Two spikes, run in order. Both artifacts live in this directory.
 
-## What this settles
+## Spike 1: hand-written WAT (`counter.wat`, `run.mjs`)
 
-**WasmGC runs where we need it.** Node 25 executes `struct.new/get/set` and
-typed globals with no flags; browser support was already there (Chrome/FF
-since 2023, Safari 18.2). No blocker.
+A hand-written GC module (state in a `struct` behind a typed global,
+renders serialized to linear memory) decodes with the real
+`www/zumar-wire.js` under Node. Settled the basics: WasmGC runs where we
+need it, and the boundary shape (GC heap for state, linear memory for the
+wire buffer) works.
 
-**The boundary doesn't change.** The module keeps state on the GC heap but
-still writes the wire buffer to linear memory and returns `(offset, len)` —
-the same shape wasm-bindgen produces today. So the wire format, the JS shim,
-and the decoder are all reused verbatim; phase 3 touches only the backend.
-That's the runtime-first bet paying off a second time.
+## Spike 2: emitted from the real AST (`zuc-gc`, `run-emitted.mjs`)
 
-## Emission strategy (the question the spike was for)
+`crates/zumar-wasmgc` compiles `counter.zu` — through the real zumar-lang
+frontend — straight to a WasmGC binary via the `wasm-encoder` crate. No
+Rust toolchain, no wasm-bindgen, no runtime crate: the module is the whole
+app. **1,253 bytes**, versus ~57 KB for the same app through the Rust
+backend. Passes `wasm-tools validate` and a 14-assertion behavior harness
+(bubbled events, negative itoa, nested-if conditional text, no-op on
+unhandled paths) through the real wire decoder.
 
-Three options considered:
+## What the second spike settled
 
-1. **Emit WAT text, shell out to `wasm-tools`.** Readable, trivial to debug,
-   but puts an external binary in the user's build loop.
-2. **Hand-roll a binary encoder** (LEB128, sections, GC type indices).
-   Self-contained but a lot of fiddly code to get right.
-3. **Use the `wasm-encoder` crate** (from the wasm-tools project) to emit
-   binary directly from `zuc`. No external process, no hand-rolled LEB128,
-   and it's the same well-tested encoder `wasm-tools` uses.
+**The runtime.wasm question is retired.** The first spike assumed phase 3
+needed the Rust runtime compiled to WasmGC — which rustc can't do. The way
+out is better than the workaround: because `.zu` views are statically
+known, the compiler emits a **compile-time patch plan**. It knows at
+compile time which text nodes are dynamic and where they live; `dispatch`
+runs the update against the GC model struct and re-serializes exactly
+those texts as SetText patches. No vdom in memory, no diff at runtime, no
+runtime port. (This is the Svelte insight applied to the zumar protocol.)
 
-**Decision: option 3.** `zuc` links `wasm-encoder` and emits WasmGC binary
-directly; keep a `--emit wat` debug flag that goes through option 1 for
-eyeballing output.
+**The no-glue boundary.** wasm-bindgen glue is replaced by four raw
+exports:
 
-## The real phase-3 design problem
+- `init() -> len` — wire-encoded InitialRender at `mem[0..len]`
+- `dispatch(event_idx, path_len) -> len` — `event_idx` indexes the events
+  array from the init message; the host writes the path's u32s at
+  `path_buf` first
+- `mem`, `path_buf`
 
-The current Rust backend gets the entire runtime — diff, effects, wire
-encoding, event resolution — for free by linking `zumar-core`/`zumar-runtime`.
-A WasmGC backend can't link Rust crates. Two ways out:
+Handler resolution compiles to a deepest-first prefix match over the
+static handler table — same bubbling semantics as the runtime, no vdom
+walk. The shim change to support this interface next to the wasm-bindgen
+one is small (write path to `path_buf` instead of passing a `Uint32Array`).
 
-- **Re-emit the runtime per app** — `zuc` generates diff/wire/loop code into
-  every module. Large modules, and the tested runtime gets duplicated by a
-  second implementation. Rejected.
-- **Precompiled `runtime.wasm`** — compile `zumar-core`/`zumar-runtime` to
-  WasmGC *once*, ship it, and have `zuc` emit only the app module
-  (model/update/view) which imports the runtime's exports. Small per-app
-  output, one shared tested runtime. This is the path.
+## What's still ahead for a real backend
 
-So phase 3 is really two pieces: (a) a `runtime.wasm` build of the existing
-crates with a stable import interface, and (b) a `zuc` backend that emits a
-small app module against it. (a) is the load-bearing unknown — worth its own
-spike before committing.
+- **Dynamic structure**: `for` list rendering breaks "static tree". The
+  plan shape: each `for` region becomes a compile-time region marker;
+  dispatch re-serializes the region's children and emits a Replace (or
+  truncate+append) on that parent — still no general diff, keyed moves
+  can come later.
+- **Strings and records on the GC heap**: model fields beyond Int need GC
+  arrays (i8 arrays for strings) and nested structs; `witoa` generalizes
+  to a small emitted stdlib.
+- **Payloads**: `value`/`checked`/`key` arrive via a staging buffer like
+  the path does.
+- **Effects**: cmds/subs serialization is already in the wire format; the
+  emitted module just writes them.
 
-## Cost
-
-Getting a counter through option 3 against a precompiled runtime is a
-week-ish of focused work. Full parity with the Rust backend (records, lists,
-comprehensions lowered to GC arrays) is more. The Rust backend stays the
-default until the WasmGC path reaches parity.
+Subset today: Int model fields, payload-less messages, static tree,
+literal attributes, dynamic text via `show`/`if`. Everything else errors
+with "not yet in the wasmgc backend" and the Rust backend remains the
+default.
 
 ## Repro
 
 ```sh
-wasm-tools parse counter.wat -o counter.wasm
-node run.mjs
+# spike 1
+wasm-tools parse counter.wat -o counter.wasm && node run.mjs
+# spike 2
+cargo run -p zumar-wasmgc --bin zuc-gc -- \
+  ../../examples/lang-counter/counter.zu -o counter-emitted.wasm
+node run-emitted.mjs
 ```

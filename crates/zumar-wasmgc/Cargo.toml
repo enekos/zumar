@@ -1,0 +1,16 @@
+[package]
+name = "zumar-wasmgc"
+description = "WasmGC backend spike: emit self-contained GC modules from the zumar-lang AST via wasm-encoder. Counter subset; compile-time patch plans instead of a runtime diff."
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+wasm-encoder = "0.252.0"
+zumar-lang = { path = "../zumar-lang" }
+
+[[bin]]
+name = "zuc-gc"
+path = "src/bin/zuc-gc.rs"
+
+[dev-dependencies]
+wasmparser = "0.252.0"

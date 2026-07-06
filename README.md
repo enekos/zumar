@@ -136,9 +136,15 @@ verbatim.
 - `crates/zumar-core` — vdom, diff, patch types. No wasm, no DOM.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
 - `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
+- `crates/zumar-wasmgc` — the WasmGC backend, spike stage: `zuc-gc` compiles
+  the counter subset of `.zu` straight to a self-contained GC binary via
+  `wasm-encoder` — no Rust toolchain, no wasm-bindgen, no runtime. The
+  counter is 1.3 KB (vs ~57 KB through the Rust backend), and instead of a
+  runtime diff it emits a compile-time patch plan: views are static, so the
+  compiler knows exactly which text nodes to re-serialize per update.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
   and lang-counter / lang-todo / lang-expenses / lang-queue (compiled from `.zu`).
-- `spikes/wasmgc` — a hand-written WasmGC module proving the phase-3 path.
+- `spikes/wasmgc` — findings + harnesses for the GC backend.
 
 ## Numbers
 
@@ -179,8 +185,11 @@ python3 -m http.server 8765 -d www
 5. ~~zumar-lang v0~~ + ~~phase 2: records, lists, payloads, comprehensions
    (`todo.zu`)~~ + ~~phase 2.1: `sum`, `nth`, `toInt` (`expenses.zu`)~~ +
    ~~phase 2.2: `Maybe` + `case` (`queue.zu`)~~
-6. next: user-defined sum types + general pattern matching (generalizing
-   `case`), effects syntax, then a WasmGC backend behind the same AST —
-   `spikes/wasmgc` maps that path.
+6. ~~WasmGC backend spike: `zuc-gc` emits the counter subset as a 1.3 KB
+   self-contained GC module (compile-time patch plans instead of a runtime
+   diff; findings in `spikes/wasmgc`)~~
+7. next: grow the GC backend toward the full language (strings/records on
+   the GC heap, `for` regions, payload staging); user-defined sum types +
+   general pattern matching; effects syntax.
 
 MIT.

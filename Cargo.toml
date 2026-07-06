@@ -4,6 +4,7 @@ members = [
     "crates/zumar-core",
     "crates/zumar-lang",
     "crates/zumar-runtime",
+    "crates/zumar-wasmgc",
     "examples/counter",
     "examples/todo",
     "examples/effects",
