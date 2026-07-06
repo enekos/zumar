@@ -118,6 +118,31 @@ view =
     }
 
     #[test]
+    fn both_targets_expose_program_and_gate_wasm() {
+        let app = compile(COUNTER).unwrap();
+        // Same lib.rs for both: a public `program()` constructor, wasm-bindgen
+        // behind a cfg. The client build turns the feature on; the server
+        // (sutegi-zumar) leaves it off and mounts `program()` directly.
+        let lib = gen::generate_with(&app, "zumar-core = {}", gen::Target::Live).lib_rs;
+        assert!(lib.contains("pub fn program() -> zumar_runtime::Program<Model, Msg>"));
+        assert!(lib.contains("#[cfg(feature = \"wasm\")]\nuse wasm_bindgen"));
+        assert!(lib.contains("#[cfg(feature = \"wasm\")]\nzumar_runtime::zumar_app!"));
+
+        // The manifests are what differ: live keeps wasm-bindgen optional and
+        // off, and omits [workspace] so it embeds as a path dep.
+        let live = gen::generate_with(&app, "zumar-core = {}", gen::Target::Live).cargo_toml;
+        assert!(live.contains("default = []"));
+        assert!(live.contains("wasm-bindgen = { version = \"0.2\", optional = true }"));
+        assert!(!live.contains("[workspace]"));
+        assert!(!live.contains("cdylib"));
+
+        let wasm = gen::generate(&app, "zumar-core = {}").cargo_toml;
+        assert!(wasm.contains("default = [\"wasm\"]"));
+        assert!(wasm.contains("[workspace]"));
+        assert!(wasm.contains("cdylib"));
+    }
+
+    #[test]
     fn counter_compiles() {
         let app = compile(COUNTER).unwrap();
         assert_eq!(app.name, "Counter");

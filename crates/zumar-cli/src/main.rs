@@ -1,8 +1,9 @@
 //! zuc — the zumar-lang compiler CLI.
 //!
 //!   zuc check <file.zu>                       parse + typecheck
-//!   zuc build <file.zu> --out <dir> [--zumar <path>]
-//!                                             emit the Rust crate
+//!   zuc build <file.zu> --out <dir> [--target wasm|live] [--zumar <path>]
+//!                                             emit the Rust crate (browser
+//!                                             or server-side `live` rlib)
 //!   zuc new <name> [--zumar <path>]           scaffold a project
 //!   zuc dev [<file.zu>] [--port N] [--zumar <path>]
 //!                                             build, serve, watch, reload
@@ -35,7 +36,7 @@ const LIVE_JS: &str = include_str!("../../../www/zumar-live.js");
 
 const USAGE: &str = "usage:
   zuc check <file.zu> [--with <decls.zu>]
-  zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--with <decls.zu>] [--zumar <path>]
+  zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--target wasm|live] [--with <decls.zu>] [--zumar <path>]
   zuc new <name>
   zuc dev [<file.zu>] [--backend rust|gc] [--port N] [--zumar <path>]
   zuc assets <www-dir>
@@ -43,6 +44,10 @@ const USAGE: &str = "usage:
 --backend gc emits a self-contained WasmGC module: no cargo, no wasm-pack,
 millisecond rebuilds. the default rust backend needs the zumar repo root
 (--zumar or $ZUMAR_HOME) and wasm-pack.
+
+--target live (rust backend only) emits a wasm-free rlib exposing
+`pub fn program()`, to mount server-side per connection in the sutegi-zumar
+live bridge. --target wasm (default) is the browser build.
 
 `assets` (re)writes the framework JS (zumar.js, zumar-wire.js, zumar-gc.js,
 zumar-live.js) plus a gc-backend boot.js into an existing www/ directory,
@@ -61,6 +66,17 @@ fn backend(args: &[String]) -> Result<Backend, String> {
         None | Some("rust") => Ok(Backend::Rust),
         Some("gc") => Ok(Backend::Gc),
         Some(other) => Err(format!("unknown backend `{other}` (rust or gc)")),
+    }
+}
+
+/// `--target wasm` (default) builds a wasm-pack browser module; `--target
+/// live` builds a wasm-free rlib to mount server-side (sutegi-zumar). Only
+/// meaningful for the Rust backend.
+fn target(args: &[String]) -> Result<zumar_lang::gen::Target, String> {
+    match flag(args, "--target").as_deref() {
+        None | Some("wasm") => Ok(zumar_lang::gen::Target::Wasm),
+        Some("live") => Ok(zumar_lang::gen::Target::Live),
+        Some(other) => Err(format!("unknown target `{other}` (wasm or live)")),
     }
 }
 
@@ -107,10 +123,23 @@ fn run(args: &[String]) -> Result<String, String> {
                 }
                 Backend::Rust => {
                     let deps = deps_fragment(zumar_path(args)?.as_deref());
-                    let generated = write_crate(&app, Path::new(&out), &deps)?;
+                    let target = target(args)?;
+                    let generated = write_crate(&app, Path::new(&out), &deps, target)?;
+                    let next = match target {
+                        zumar_lang::gen::Target::Wasm => {
+                            format!("next: zuc dev, or wasm-pack build {out} --target web")
+                        }
+                        zumar_lang::gen::Target::Live => format!(
+                            "next: depend on `{generated}` from a server and mount `{generated}::program()` (sutegi-zumar)"
+                        ),
+                    };
                     Ok(format!(
-                        "{file}: compiled app {} -> {out}/ (crate `{}`)\nnext: zuc dev, or wasm-pack build {out} --target web",
-                        app.name, generated
+                        "{file}: compiled app {} -> {out}/ (crate `{generated}`, {} target)\n{next}",
+                        app.name,
+                        match target {
+                            zumar_lang::gen::Target::Wasm => "wasm",
+                            zumar_lang::gen::Target::Live => "live",
+                        },
                     ))
                 }
             }
@@ -196,8 +225,13 @@ fn report(file: &str, src: &str, e: &ZuError) -> String {
     out.trim_end().to_string()
 }
 
-fn write_crate(app: &zumar_lang::App, out: &Path, deps: &str) -> Result<String, String> {
-    let generated = zumar_lang::gen::generate(app, deps);
+fn write_crate(
+    app: &zumar_lang::App,
+    out: &Path,
+    deps: &str,
+    target: zumar_lang::gen::Target,
+) -> Result<String, String> {
+    let generated = zumar_lang::gen::generate_with(app, deps, target);
     let src_dir = out.join("src");
     std::fs::create_dir_all(&src_dir).map_err(|e| format!("{}: {e}", src_dir.display()))?;
     std::fs::write(out.join("Cargo.toml"), &generated.cargo_toml).map_err(|e| e.to_string())?;
@@ -415,7 +449,7 @@ fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
     let (app, _) = compile_file(file, None)?;
     write_boot(proj, Backend::Rust, &app.name.to_lowercase())?;
     let app_dir = proj.join("app");
-    write_crate(&app, &app_dir, deps)?;
+    write_crate(&app, &app_dir, deps, zumar_lang::gen::Target::Wasm)?;
 
     let output = Command::new("wasm-pack")
         .args(["build", "--dev", "--target", "web", "--out-dir"])

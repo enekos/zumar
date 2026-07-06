@@ -54,6 +54,18 @@ jobs:
           cargo run --release -p zumar-cli --bin zuc -- build clock.zu --out app --zumar "$PWD/../.."
           wasm-pack build app --target web --out-dir ../www/pkg --release
           cd www && cp ../test.mjs . && node test.mjs
+      - name: live target compiles wasm-free (server-side program())
+        run: |
+          # clock.zu exercises the full surface (effects + subs). The live
+          # crate must build with NO wasm-bindgen compiled — it is what the
+          # sutegi-zumar bridge mounts per connection.
+          cargo run --release -p zumar-cli --bin zuc -- build \
+            examples/lang-clock/clock.zu --target live --out /tmp/zu-live --zumar "$PWD"
+          ( cd /tmp/zu-live && cargo build )
+          if cargo tree --manifest-path /tmp/zu-live/Cargo.toml -e normal | grep -q wasm-bindgen; then
+            echo "wasm-bindgen leaked into the live target"; exit 1
+          fi
+          grep -q "pub fn program()" /tmp/zu-live/src/lib.rs
       - name: wasmgc backend (emit counter/hello/todo, run behavior harnesses)
         run: |
           for app in counter hello todo clock kanban queue expenses; do
