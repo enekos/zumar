@@ -6,6 +6,10 @@
 //!   zuc new <name> [--zumar <path>]           scaffold a project
 //!   zuc dev [<file.zu>] [--port N] [--zumar <path>]
 //!                                             build, serve, watch, reload
+//!   zuc assets <www-dir>                      (re)write the framework JS
+//!                                             into an existing www/ — for
+//!                                             hosts that serve the page
+//!                                             themselves (sutegi fullstack)
 //!
 //! The zumar repo root comes from `--zumar` or the `ZUMAR_HOME` env var.
 //! Everything here is std-only: the dev server is a plain TcpListener, the
@@ -27,16 +31,24 @@ use zumar_lang::ZuError;
 const SHIM_JS: &str = include_str!("../../../www/zumar.js");
 const WIRE_JS: &str = include_str!("../../../www/zumar-wire.js");
 const GC_JS: &str = include_str!("../../../www/zumar-gc.js");
+const LIVE_JS: &str = include_str!("../../../www/zumar-live.js");
 
 const USAGE: &str = "usage:
   zuc check <file.zu>
   zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--zumar <path>]
   zuc new <name>
   zuc dev [<file.zu>] [--backend rust|gc] [--port N] [--zumar <path>]
+  zuc assets <www-dir>
 
 --backend gc emits a self-contained WasmGC module: no cargo, no wasm-pack,
 millisecond rebuilds. the default rust backend needs the zumar repo root
-(--zumar or $ZUMAR_HOME) and wasm-pack.";
+(--zumar or $ZUMAR_HOME) and wasm-pack.
+
+`assets` (re)writes the framework JS (zumar.js, zumar-wire.js, zumar-gc.js,
+zumar-live.js) plus a gc-backend boot.js into an existing www/ directory,
+for hosts that serve the page themselves — e.g. sutegi fullstack projects,
+where `sutegi dev` refreshes them on every start so the shim always matches
+the installed zuc.";
 
 #[derive(Clone, Copy, PartialEq)]
 enum Backend {
@@ -103,6 +115,7 @@ fn run(args: &[String]) -> Result<String, String> {
         }
         Some("new") => scaffold(args.get(1).ok_or(USAGE)?),
         Some("dev") => dev(args),
+        Some("assets") => assets(args.get(1).ok_or(USAGE)?),
         _ => Err(USAGE.into()),
     }
 }
@@ -419,6 +432,13 @@ fn build_gc(file: &str, proj: &Path) -> Result<f64, String> {
     Ok(started.elapsed().as_secs_f64())
 }
 
+const GC_BOOT: &str = r#"// written by zuc (wasmgc backend) — edit index.html, not this file
+import { mount } from "./zumar.js";
+import { gcApp } from "./zumar-gc.js";
+const { instance } = await WebAssembly.instantiateStreaming(fetch("./pkg/app.wasm"), {});
+mount(gcApp(instance.exports), document.getElementById("app"));
+"#;
+
 /// www/boot.js is zuc's artifact (index.html imports it): it loads the app
 /// through whichever backend the dev loop is building.
 fn write_boot(proj: &Path, backend: Backend, crate_name: &str) -> Result<(), String> {
@@ -431,15 +451,29 @@ await init();
 mount(new App(), document.getElementById("app"));
 "#
         ),
-        Backend::Gc => r#"// written by zuc (wasmgc backend) — edit index.html, not this file
-import { mount } from "./zumar.js";
-import { gcApp } from "./zumar-gc.js";
-const { instance } = await WebAssembly.instantiateStreaming(fetch("./pkg/app.wasm"), {});
-mount(gcApp(instance.exports), document.getElementById("app"));
-"#
-        .to_string(),
+        Backend::Gc => GC_BOOT.to_string(),
     };
     std::fs::write(proj.join("www/boot.js"), boot).map_err(|e| e.to_string())
+}
+
+/// `zuc assets <www-dir>`: (re)write the framework JS + a gc boot.js into a
+/// www/ served by someone else (sutegi fullstack). Idempotent; boot.js and
+/// the shims are zuc's artifacts there, index.html is not touched.
+fn assets(dir: &str) -> Result<String, String> {
+    let www = Path::new(dir);
+    std::fs::create_dir_all(www).map_err(|e| format!("{dir}: {e}"))?;
+    for (name, body) in [
+        ("zumar.js", SHIM_JS),
+        ("zumar-wire.js", WIRE_JS),
+        ("zumar-gc.js", GC_JS),
+        ("zumar-live.js", LIVE_JS),
+        ("boot.js", GC_BOOT),
+    ] {
+        std::fs::write(www.join(name), body).map_err(|e| format!("{dir}/{name}: {e}"))?;
+    }
+    Ok(format!(
+        "{dir}: wrote zumar.js, zumar-wire.js, zumar-gc.js, zumar-live.js, boot.js (gc)"
+    ))
 }
 
 // --- the dev server ---------------------------------------------------------
