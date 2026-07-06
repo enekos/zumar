@@ -59,14 +59,40 @@ view =
 ```
 
 Updates are total: declaring a message and not handling it is a compile
-error. v0 is deliberately small — one model record (Int/String/Bool),
-messages without payloads, expressions with arithmetic, `++`, comparisons,
-`if`, `show`. Message payloads and list rendering are next; the todo
-example can't be written in zumar-lang yet, which is the point of the next
-milestone.
+error. The language has scalars (Int/String/Bool), `record` types, `List`,
+message payloads, and a small functional layer — list literals, record
+literals and updates (`{ x | field = e }`), and comprehensions
+(`for x in xs where c yield e`). Events cover `onClick`/`onChange`/`onSubmit`
+(with a message value) and `onInput`/`onCheck` (constructor takes the event
+payload); `for x in xs { <element> }` renders keyed lists.
+
+The full todo app — the phase-2 target — is now expressible:
+
+```
+record Item { id: Int, text: String, done: Bool }
+model { draft: String, items: List Item, seq: Int }
+
+update Add = {
+  items = model.items ++ [{ id = model.seq, text = model.draft, done = false }],
+  seq = model.seq + 1, draft = ""
+}
+update Toggle id = {
+  items = for t in model.items yield (if t.id == id then { t | done = not t.done } else t)
+}
+update Delete id = { items = for t in model.items where t.id != id yield t }
+```
+
+See `examples/lang-todo/todo.zu` for the whole thing.
 
 `zuc check` typechecks, `zuc build` emits a Rust crate, `zuc dev` builds,
 serves, watches and live-reloads.
+
+### Not there yet
+
+Dogfooding todo surfaced the concrete gaps: no `sum`/`fold` over a list
+(only `length`), no indexing a list by position, and no `String`→`Int`
+parse, so numeric text-input apps aren't expressible. These are the next
+small additions, ahead of the WasmGC backend.
 
 ## The protocol
 
@@ -94,8 +120,8 @@ verbatim.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
 - `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
-  lang-counter (compiled from `counter.zu`; generated crate committed for
-  inspection).
+  lang-counter and lang-todo (both compiled from `.zu`).
+- `spikes/wasmgc` — a hand-written WasmGC module proving the phase-3 path.
 
 ## Numbers
 
@@ -133,7 +159,10 @@ python3 -m http.server 8765 -d www
 2. ~~keyed diffing, input/form events~~
 3. ~~commands and subscriptions~~
 4. ~~binary wire format~~
-5. zumar-lang — v0 done; next: message payloads, `onInput`, list rendering
-   (unlocks `todo.zu`), then a WasmGC backend behind the same AST.
+5. ~~zumar-lang v0~~ + ~~phase 2: records, lists, payloads, comprehensions
+   (`todo.zu` compiles)~~
+6. next: `sum`/`fold`, list indexing, `String`→`Int` parse, then a WasmGC
+   backend behind the same AST — `spikes/wasmgc` maps the path (precompiled
+   `runtime.wasm` + a small app-module emitter via `wasm-encoder`).
 
 MIT.
