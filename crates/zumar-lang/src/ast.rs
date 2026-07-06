@@ -47,6 +47,12 @@ pub enum Expr {
     Show(Box<Expr>, Pos),
     /// `length(<List>)` -> Int
     Len(Box<Expr>, Pos),
+    /// `sum(<List Int>)` -> Int
+    Sum(Box<Expr>, Pos),
+    /// `toInt(<String>)` -> Int (0 when the string isn't an integer)
+    ToInt(Box<Expr>, Pos),
+    /// `nth(<List T>, <Int>, <T default>)` -> T (default when out of bounds)
+    Nth(Box<Expr>, Box<Expr>, Box<Expr>, Pos),
     /// `reverse(<List T>)` -> List T
     Reverse(Box<Expr>, Pos),
     /// `not <Bool>`

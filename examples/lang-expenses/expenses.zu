@@ -1,0 +1,46 @@
+# expenses.zu — the phase-2.1 dogfood.
+# Needs the new builtins: toInt (parse the amount field) and sum (total
+# over a comprehension). A numeric-input app, which v2.0 couldn't express.
+
+app Expenses
+
+record Item { id: Int, label: String, cents: Int }
+
+model { label: String, amount: String, items: List Item, seq: Int }
+
+init = { label = "", amount = "", items = [], seq = 1 }
+
+msg Label String | Amount String | Add | Delete Int
+
+update Label s = { label = s }
+update Amount s = { amount = s }
+
+update Add = {
+  items = model.items ++ [{ id = model.seq, label = model.label, cents = toInt(model.amount) }],
+  seq = model.seq + 1,
+  label = "",
+  amount = ""
+}
+
+update Delete id = { items = for t in model.items where t.id != id yield t }
+
+view =
+  div [class "exp"] [
+    h1 [] [ text "expenses" ],
+    p [class "sub"] [ text "compiled from expenses.zu — sum + toInt" ],
+    form [onSubmit Add] [
+      input [type "text", placeholder "what for?", value model.label, onInput Label] [],
+      input [type "text", placeholder "cents", value model.amount, onInput Amount] [],
+      button [type "submit"] [ text "add" ]
+    ],
+    div [class "total"] [ text (show(sum(for t in model.items yield t.cents)) ++ "¢ total") ],
+    ul [class "items"] [
+      for t in model.items {
+        li [key show(t.id)] [
+          span [class "label"] [ text t.label ],
+          span [class "cents"] [ text (show(t.cents) ++ "¢") ],
+          button [class "del", onClick Delete(t.id)] [ text "x" ]
+        ]
+      }
+    ]
+  ]

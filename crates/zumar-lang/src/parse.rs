@@ -26,7 +26,8 @@
 //! unary   := "not" unary | postfix
 //! postfix := atom ("." IDENT)*
 //! atom    := INT | STRING | "true" | "false" | IDENT
-//!          | "show"|"length"|"reverse" "(" expr ")"
+//!          | "show"|"length"|"sum"|"toInt"|"reverse" "(" expr ")"
+//!          | "nth" "(" expr "," expr "," expr ")"
 //!          | "[" expr,* "]" | "{" recordbody "}" | "(" expr ")" | "-" atom
 //! ```
 
@@ -572,7 +573,27 @@ impl Parser {
                 "false" => Ok(Expr::Bool(false)),
                 "show" => Ok(Expr::Show(Box::new(self.paren_arg()?), t.pos)),
                 "length" => Ok(Expr::Len(Box::new(self.paren_arg()?), t.pos)),
+                "sum" => Ok(Expr::Sum(Box::new(self.paren_arg()?), t.pos)),
+                "toInt" => Ok(Expr::ToInt(Box::new(self.paren_arg()?), t.pos)),
                 "reverse" => Ok(Expr::Reverse(Box::new(self.paren_arg()?), t.pos)),
+                "nth" => {
+                    let args = self.paren_args()?;
+                    let [list, index, default] = <[Expr; 3]>::try_from(args).map_err(|v| {
+                        ZuError::at(
+                            t.pos,
+                            format!(
+                                "nth(list, index, default) takes 3 arguments, got {}",
+                                v.len()
+                            ),
+                        )
+                    })?;
+                    Ok(Expr::Nth(
+                        Box::new(list),
+                        Box::new(index),
+                        Box::new(default),
+                        t.pos,
+                    ))
+                }
                 _ => Ok(Expr::Var(s, t.pos)),
             },
             other => Err(ZuError::at(
@@ -587,6 +608,22 @@ impl Parser {
         let e = self.expr()?;
         self.expect(Tok::RParen)?;
         Ok(e)
+    }
+
+    fn paren_args(&mut self) -> Result<Vec<Expr>, ZuError> {
+        self.expect(Tok::LParen)?;
+        let mut args = Vec::new();
+        if self.peek().tok != Tok::RParen {
+            loop {
+                args.push(self.expr()?);
+                if self.peek().tok != Tok::Comma {
+                    break;
+                }
+                self.next();
+            }
+        }
+        self.expect(Tok::RParen)?;
+        Ok(args)
     }
 
     /// A `{...}` in expression position: record literal `{ f = e }` or record

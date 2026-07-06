@@ -249,6 +249,93 @@ view = form [onSubmit Send] [ input [value model.draft, onInput Draft] [] ]
         assert!(err.msg.contains("unknown type `Itm`"), "{err}");
     }
 
+    const EXPENSES: &str = r#"
+app Expenses
+record Item { id: Int, label: String, cents: Int }
+model { label: String, amount: String, items: List Item, seq: Int }
+init = { label = "", amount = "", items = [], seq = 1 }
+msg Label String | Amount String | Add | Delete Int
+update Label s = { label = s }
+update Amount s = { amount = s }
+update Add = {
+  items = model.items ++ [{ id = model.seq, label = model.label, cents = toInt(model.amount) }],
+  seq = model.seq + 1, label = "", amount = ""
+}
+update Delete id = { items = for t in model.items where t.id != id yield t }
+view =
+  div [] [
+    span [] [ text (show(sum(for t in model.items yield t.cents)) ++ " total") ],
+    ul [] [ for t in model.items { li [key show(t.id)] [ text t.label ] } ]
+  ]
+"#;
+
+    #[test]
+    fn expenses_compiles_with_sum_and_toint() {
+        let rs = gen_rs(EXPENSES);
+        assert!(rs.contains(".iter().sum::<i64>()"), "{rs}");
+        assert!(
+            rs.contains("model.amount.parse::<i64>().unwrap_or(0)"),
+            "{rs}"
+        );
+    }
+
+    #[test]
+    fn sum_requires_list_int() {
+        // sum over a List of records is a type error.
+        let src = EXPENSES.replace(
+            "sum(for t in model.items yield t.cents)",
+            "sum(model.items)",
+        );
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("sum(..) takes a List Int"), "{err}");
+    }
+
+    #[test]
+    fn nth_typechecks_and_lowers() {
+        let src = r#"
+app N
+record Card { id: Int, face: String }
+model { idx: Int, cards: List Card }
+init = { idx = 0, cards = [] }
+msg Next
+update Next = { idx = model.idx + 1 }
+view = div [] [ text (nth(model.cards, model.idx, { id = 0, face = "?" }).face) ]
+"#;
+        let rs = gen_rs(src);
+        assert!(
+            rs.contains(".get((model.idx) as usize).cloned().unwrap_or("),
+            "{rs}"
+        );
+    }
+
+    #[test]
+    fn nth_default_type_is_checked() {
+        let src = r#"
+app N
+model { xs: List Int, i: Int }
+init = { xs = [], i = 0 }
+msg M
+update M = { i = nth(model.xs, model.i, "oops") }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("nth default"), "{err}");
+    }
+
+    #[test]
+    fn toint_needs_a_string() {
+        let src = r#"
+app T
+model { n: Int }
+init = { n = 0 }
+msg M
+update M = { n = toInt(model.n) }
+view = div [] []
+"#;
+        let err = compile(src).unwrap_err();
+        assert!(err.msg.contains("toInt(..) takes a String"), "{err}");
+    }
+
     #[test]
     fn pathological_nesting_errors_cleanly() {
         let bomb = format!(

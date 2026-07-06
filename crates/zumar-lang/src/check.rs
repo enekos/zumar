@@ -334,6 +334,31 @@ impl Checker {
                     format!("length(..) takes a List, got {other}"),
                 )),
             },
+            Expr::Sum(inner, pos) => match self.infer(inner, None, env)? {
+                Ty::List(t) if *t == Ty::Int => Ok(Ty::Int),
+                other => Err(ZuError::at(
+                    *pos,
+                    format!("sum(..) takes a List Int, got {other}"),
+                )),
+            },
+            Expr::ToInt(inner, pos) => {
+                self.expect_ty(inner, &Ty::Str, env, *pos, "toInt(..) takes a String")?;
+                Ok(Ty::Int)
+            }
+            Expr::Nth(list, index, default, pos) => {
+                let elem = match self.infer(list, None, env)? {
+                    Ty::List(t) => *t,
+                    other => {
+                        return Err(ZuError::at(
+                            *pos,
+                            format!("nth(..) takes a List, got {other}"),
+                        ))
+                    }
+                };
+                self.expect_ty(index, &Ty::Int, env, *pos, "nth index must be an Int")?;
+                self.expect(default, &elem, env, "nth default")?;
+                Ok(elem)
+            }
             Expr::Reverse(inner, pos) => match self.infer(inner, None, env)? {
                 Ty::List(t) => Ok(Ty::List(t)),
                 other => Err(ZuError::at(
@@ -557,6 +582,9 @@ fn pos_of(expr: &Expr) -> Pos {
         | Expr::Field(_, _, p)
         | Expr::Show(_, p)
         | Expr::Len(_, p)
+        | Expr::Sum(_, p)
+        | Expr::ToInt(_, p)
+        | Expr::Nth(_, _, _, p)
         | Expr::Reverse(_, p)
         | Expr::Not(_, p)
         | Expr::Bin(_, _, _, p)

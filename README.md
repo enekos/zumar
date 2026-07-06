@@ -87,12 +87,17 @@ See `examples/lang-todo/todo.zu` for the whole thing.
 `zuc check` typechecks, `zuc build` emits a Rust crate, `zuc dev` builds,
 serves, watches and live-reloads.
 
+List helpers: `length`, `sum` (over a `List Int`), `reverse`, and
+`nth(list, i, default)` — total, returning the default when the index is
+out of range, since there's no `Maybe` type yet. `toInt(s)` parses a
+`String` to `Int` (0 on failure), which is what makes numeric text inputs
+work — see `examples/lang-expenses`.
+
 ### Not there yet
 
-Dogfooding todo surfaced the concrete gaps: no `sum`/`fold` over a list
-(only `length`), no indexing a list by position, and no `String`→`Int`
-parse, so numeric text-input apps aren't expressible. These are the next
-small additions, ahead of the WasmGC backend.
+No general `fold`/lambdas (only the fixed helpers above), and no sum types,
+so error-free indexing leans on a default rather than a `Maybe`. Those, plus
+effects syntax in the language, come before or alongside the WasmGC backend.
 
 ## The protocol
 
@@ -120,7 +125,7 @@ verbatim.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
 - `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
 - `examples/` — counter, todo (keyed lists, forms), effects (timers, HTTP),
-  lang-counter and lang-todo (both compiled from `.zu`).
+  and lang-counter / lang-todo / lang-expenses (all compiled from `.zu`).
 - `spikes/wasmgc` — a hand-written WasmGC module proving the phase-3 path.
 
 ## Numbers
@@ -160,9 +165,10 @@ python3 -m http.server 8765 -d www
 3. ~~commands and subscriptions~~
 4. ~~binary wire format~~
 5. ~~zumar-lang v0~~ + ~~phase 2: records, lists, payloads, comprehensions
-   (`todo.zu` compiles)~~
-6. next: `sum`/`fold`, list indexing, `String`→`Int` parse, then a WasmGC
-   backend behind the same AST — `spikes/wasmgc` maps the path (precompiled
-   `runtime.wasm` + a small app-module emitter via `wasm-encoder`).
+   (`todo.zu` compiles)~~ + ~~phase 2.1: `sum`, `nth`, `toInt`
+   (`expenses.zu` compiles)~~
+6. next: a WasmGC backend behind the same AST — `spikes/wasmgc` maps the path
+   (precompiled `runtime.wasm` + a small app-module emitter via
+   `wasm-encoder`); sum types / `Maybe` and effects syntax alongside.
 
 MIT.

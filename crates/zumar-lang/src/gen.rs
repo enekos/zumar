@@ -319,8 +319,29 @@ impl Gen {
                 (format!("({code}).to_string()"), Ty::Str)
             }
             Expr::Len(inner, _) => {
-                let (code, _) = self.emit(inner, None, env);
+                let code = self.emit_operand(inner, env);
                 (format!("(({code}).len() as i64)"), Ty::Int)
+            }
+            Expr::Sum(inner, _) => {
+                let code = self.emit_operand(inner, env);
+                (format!("(({code}).iter().sum::<i64>())"), Ty::Int)
+            }
+            Expr::ToInt(inner, _) => {
+                let code = self.emit_operand(inner, env);
+                (format!("({code}.parse::<i64>().unwrap_or(0))"), Ty::Int)
+            }
+            Expr::Nth(list, index, default, _) => {
+                let list_code = self.emit_operand(list, env);
+                let elem = match self.type_of(list, env) {
+                    Ty::List(t) => *t,
+                    _ => unreachable!("typechecked: list"),
+                };
+                let (idx, _) = self.emit(index, Some(&Ty::Int), env);
+                let (def, _) = self.emit(default, Some(&elem), env);
+                (
+                    format!("({list_code}.get(({idx}) as usize).cloned().unwrap_or({def}))"),
+                    elem,
+                )
             }
             Expr::Reverse(inner, _) => {
                 let (code, ty) = self.emit(inner, expected, env);
@@ -450,6 +471,16 @@ impl Gen {
         }
     }
 
+    /// A borrow-friendly operand for builtins whose method call auto-refs
+    /// (`.len()`/`.iter()`/`.get()`/`.parse()`): a place stays a place (no
+    /// clone), anything else is emitted owned.
+    fn emit_operand(&self, expr: &Expr, env: &Env) -> String {
+        match expr {
+            Expr::Var(..) | Expr::Field(..) => self.emit_place(expr, env).0,
+            _ => self.emit(expr, None, env).0,
+        }
+    }
+
     /// A borrow path (no clone) for a Var/Field chain — used as the base of a
     /// field access and other places.
     fn emit_place(&self, expr: &Expr, env: &Env) -> (String, Ty) {
@@ -518,7 +549,11 @@ impl Gen {
                 _ => unreachable!(),
             },
             Expr::Show(..) => Ty::Str,
-            Expr::Len(..) => Ty::Int,
+            Expr::Len(..) | Expr::Sum(..) | Expr::ToInt(..) => Ty::Int,
+            Expr::Nth(list, _, _, _) => match self.type_of(list, env) {
+                Ty::List(t) => *t,
+                _ => unreachable!(),
+            },
             Expr::Reverse(inner, _) => self.type_of(inner, env),
             Expr::Not(..) => Ty::Bool,
             Expr::Bin(op, l, _, _) => match op {
