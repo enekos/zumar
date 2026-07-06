@@ -18,6 +18,7 @@ pub mod wire;
 
 use std::collections::BTreeMap;
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
 use zumar_core::{
@@ -25,7 +26,9 @@ use zumar_core::{
 };
 
 pub use effects::{delay, every, every_with_now, http_get};
-use effects::{Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta};
+use effects::{
+    Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta, SubSpec,
+};
 pub use zumar_core::EventPayload as WireEventPayload;
 
 /// Generate the wasm-bindgen app wrapper: constructor + the four boundary
@@ -124,12 +127,14 @@ pub struct Program<Model, Msg> {
 
 struct ActiveSub<Msg> {
     id: u32,
+    spec: SubSpec,
     callback: SubCallback<Msg>,
 }
 
 /// First render: the full tree, the event specs the shim must delegate,
 /// plus any init-time commands and subscription starts.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct InitialRender {
     pub root: SerNode,
     pub events: Vec<EventSpec>,
@@ -139,7 +144,8 @@ pub struct InitialRender {
 
 /// Result of one program step (dispatch/resolve/notify): patches to apply,
 /// the current event specs, commands to execute, subscription changes.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct Update {
     pub patches: Vec<Patch>,
     pub events: Vec<EventSpec>,
@@ -201,6 +207,28 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
             events: collect_events(&self.current),
             cmds: self.register_cmds(init_cmds),
             subs: self.diff_subs(),
+        }
+    }
+
+    /// The current state as a first render: full tree, event specs, and the
+    /// active subscriptions as `Start` deltas — what a *reconnecting* client
+    /// needs to rebuild its page. No commands: in-flight effects belong to
+    /// the transport that started them, and init commands were consumed by
+    /// [`Program::initial_render`] (their completions are the host's to
+    /// replay).
+    pub fn rerender(&self) -> InitialRender {
+        InitialRender {
+            root: SerNode::from_vnode(&self.current),
+            events: collect_events(&self.current),
+            cmds: Vec::new(),
+            subs: self
+                .active_subs
+                .values()
+                .map(|a| SubDelta::Start {
+                    id: a.id,
+                    spec: a.spec.clone(),
+                })
+                .collect(),
         }
     }
 
@@ -290,14 +318,18 @@ impl<Model, Msg: Clone> Program<Model, Msg> {
                         key,
                         ActiveSub {
                             id: active.id,
+                            spec,
                             callback,
                         },
                     );
                 }
                 None => {
                     let id = self.fresh_id();
-                    deltas.push(SubDelta::Start { id, spec });
-                    next_active.insert(key, ActiveSub { id, callback });
+                    deltas.push(SubDelta::Start {
+                        id,
+                        spec: spec.clone(),
+                    });
+                    next_active.insert(key, ActiveSub { id, spec, callback });
                 }
             }
         }
@@ -599,6 +631,36 @@ mod tests {
         );
         assert!(late.patches.is_empty());
         assert_eq!(program.model().last_now, 456.0);
+    }
+
+    #[test]
+    fn rerender_returns_current_tree_and_active_subs() {
+        let mut program = fx_program();
+        program.initial_render();
+        // toggle the sub on and mutate state, then ask for a fresh render
+        program.dispatch(&[1], "click", &EventPayload::default());
+        let SubDelta::Start { id, .. } = program.rerender().subs[0] else {
+            panic!("expected active sub as Start");
+        };
+        let re = program.rerender();
+        assert_eq!(
+            re.root,
+            SerNode::from_vnode(&(program.view)(&program.model))
+        );
+        assert!(re.cmds.is_empty());
+        assert_eq!(
+            re.subs,
+            vec![SubDelta::Start {
+                id,
+                spec: effects::SubSpec::Every { ms: 100 }
+            }]
+        );
+        // deterministic replay: a fresh program fed the same inputs
+        // rerenders to identical wire bytes
+        let mut replayed = fx_program();
+        replayed.initial_render();
+        replayed.dispatch(&[1], "click", &EventPayload::default());
+        assert_eq!(replayed.rerender().to_bytes(), re.to_bytes());
     }
 
     #[test]

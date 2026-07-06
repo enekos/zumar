@@ -230,6 +230,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "serde")] // the JSON half of the comparison needs the derives
     fn tiny_update_is_tiny() {
         let up = Update {
             patches: vec![Patch::SetText {

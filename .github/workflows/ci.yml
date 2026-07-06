@@ -23,6 +23,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: test (includes diff fuzz harness)
         run: cargo test
+      - name: tests with serde derives (feature-gated)
+        run: cargo test -p zumar-core -p zumar-runtime --features serde
       - name: js guard tests
         run: node www/test-guards.mjs
 

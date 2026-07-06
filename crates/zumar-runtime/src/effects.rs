@@ -6,6 +6,7 @@
 //! re-enters the program with `resolve(id, payload)` when a command
 //! completes and `notify(id, payload)` each time a subscription fires.
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// A one-shot effect requested by `update`. Executed once by the shim;
@@ -19,8 +20,9 @@ pub struct Cmd<Msg> {
 pub type Cmds<Msg> = Vec<Cmd<Msg>>;
 
 /// The shim-executable half of a command.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "camelCase"))]
 pub enum CmdSpec {
     Delay { ms: u32 },
     HttpGet { url: String },
@@ -42,7 +44,8 @@ pub struct HttpResult {
 
 /// Envelope for `resolve`/`notify` payloads — the effects-side analog of
 /// `EventPayload`. Fields irrelevant to the completing effect are `None`.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct FxPayload {
     pub ok: Option<bool>,
     pub status: Option<u16>,
@@ -77,8 +80,9 @@ pub struct Sub<Msg> {
     pub(crate) callback: SubCallback<Msg>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "camelCase"))]
 pub enum SubSpec {
     Every { ms: u32 },
 }
@@ -119,15 +123,17 @@ pub fn every_with_now<Msg>(ms: u32, f: fn(f64) -> Msg) -> Sub<Msg> {
 
 /// A command instance handed to the shim: execute `spec`, call
 /// `resolve(id, ...)` when done.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
 pub struct CmdOut {
     pub id: u32,
     pub spec: CmdSpec,
 }
 
 /// A subscription lifecycle change for the shim to apply.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "op", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "op", rename_all = "camelCase"))]
 pub enum SubDelta {
     Start { id: u32, spec: SubSpec },
     Stop { id: u32 },

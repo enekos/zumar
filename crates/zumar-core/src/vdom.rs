@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 /// A virtual DOM node, parameterized over the app's message type.
@@ -49,7 +50,8 @@ pub enum Handler<Msg> {
 /// the target doesn't have arrive as `None`. This is the pragmatic subset of
 /// Elm's per-listener event decoders; a declared-fields protocol can replace
 /// it later without touching handler code.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct EventPayload {
     pub value: Option<String>,
     pub checked: Option<bool>,
@@ -70,8 +72,9 @@ impl<Msg: Clone> Handler<Msg> {
 /// One delegated listener the JS shim must install on the mount root.
 /// `prevent_default` is per event *name* (OR over the whole tree) — coarse,
 /// but submit/keydown are the realistic users and they want it globally.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "camelCase"))]
 pub struct EventSpec {
     pub name: String,
     pub prevent_default: bool,

@@ -26,6 +26,33 @@ pub fn compile(source: &str) -> Result<App, ZuError> {
     Ok(app)
 }
 
+/// Shared type declarations parsed from a fragment (see
+/// [`parse::parse_decls`]) — the cross-tier seam: a server generates these
+/// from its DB schema, and every page compiles against them.
+pub struct Decls {
+    pub records: Vec<ast::RecordDef>,
+    pub enums: Vec<ast::EnumDef>,
+}
+
+/// Parse a `record`/`enum`-only fragment.
+pub fn parse_decls(source: &str) -> Result<Decls, ZuError> {
+    let (records, enums) = parse::parse_decls(source)?;
+    Ok(Decls { records, enums })
+}
+
+/// Compile a program with extra shared declarations merged in before the
+/// typecheck — so user code referencing a generated record fails to compile
+/// the moment the schema changes underneath it. The program's own
+/// declarations win no special treatment: a name declared twice is the same
+/// duplicate error it always was.
+pub fn compile_with(source: &str, decls: Decls) -> Result<App, ZuError> {
+    let mut app = parse::parse(source)?;
+    app.records.extend(decls.records);
+    app.enums.extend(decls.enums);
+    check::check(&mut app)?;
+    Ok(app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,5 +704,46 @@ view = div [] []
         let err = compile("app X\nmodel { a: Int }\ninit = { a = 0 }\nmsg M\nupdate M = { b = 1 }\nview = div [] []").unwrap_err();
         assert_eq!(err.line, 5);
         assert!(err.msg.contains("unknown field `b`"));
+    }
+
+    #[test]
+    fn compile_with_merges_shared_decls() {
+        let decls = parse_decls(
+            "record Todo { id: Int, title: String, done: Bool }\nenum Level = Low | High",
+        )
+        .unwrap();
+        let app = compile_with(
+            "app X\nmodel { items: List Todo }\ninit = { items = [] }\nmsg M\nupdate M = { items = model.items }\nview = div [] []",
+            decls,
+        )
+        .unwrap();
+        assert_eq!(app.records.len(), 1);
+        assert_eq!(app.enums.len(), 1);
+    }
+
+    #[test]
+    fn renamed_schema_field_is_a_frontend_compile_error() {
+        // The P2 payoff: user code compiled against yesterday's schema fails
+        // the moment the generated decls change underneath it.
+        let src = "app X\nmodel { items: List Todo }\ninit = { items = [ { id = 1, title = \"x\" } ] }\nmsg M\nupdate M = { items = model.items }\nview = div [] []";
+        let old = parse_decls("record Todo { id: Int, title: String }").unwrap();
+        assert!(compile_with(src, old).is_ok());
+        let renamed = parse_decls("record Todo { id: Int, name: String }").unwrap();
+        assert!(compile_with(src, renamed).is_err());
+    }
+
+    #[test]
+    fn decls_fragments_reject_program_declarations_and_duplicates() {
+        assert!(parse_decls("model { a: Int }").is_err());
+        assert!(parse_decls("record A { x: Int }\nenum B = C | D").is_ok());
+        // a fragment record colliding with a program record is the usual
+        // duplicate error
+        let decls = parse_decls("record Todo { id: Int }").unwrap();
+        let err = compile_with(
+            "app X\nrecord Todo { id: Int }\nmodel { a: Int }\ninit = { a = 0 }\nmsg M\nupdate M = { a = 0 }\nview = div [] []",
+            decls,
+        )
+        .unwrap_err();
+        assert!(err.msg.contains("duplicate record"), "{err}");
     }
 }

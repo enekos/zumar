@@ -60,6 +60,52 @@ pub fn parse(src: &str) -> Result<App, ZuError> {
     .program()
 }
 
+/// Parse a declarations-only fragment: `record` and `enum` declarations,
+/// nothing else — the shape a schema generator emits (e.g. sutegi's
+/// `schema:zu`). No `app` header; the fragment is merged into a real
+/// program by [`crate::compile_with`].
+pub fn parse_decls(src: &str) -> Result<(Vec<RecordDef>, Vec<EnumDef>), ZuError> {
+    let toks = lex(src)?;
+    let mut p = Parser {
+        toks,
+        i: 0,
+        depth: 0,
+    };
+    let mut records = Vec::new();
+    let mut enums = Vec::new();
+    loop {
+        let t = p.peek().clone();
+        match &t.tok {
+            Tok::Eof => return Ok((records, enums)),
+            Tok::Ident(kw) if kw == "record" => {
+                p.next();
+                records.push(p.record_decl()?);
+            }
+            Tok::Ident(kw) if kw == "enum" => {
+                p.next();
+                let (name, pos) = p.ident("enum name")?;
+                p.expect(Tok::Eq)?;
+                let mut variants = vec![p.variant()?];
+                while p.peek().tok == Tok::Pipe {
+                    p.next();
+                    variants.push(p.variant()?);
+                }
+                enums.push(EnumDef {
+                    name,
+                    variants,
+                    pos,
+                });
+            }
+            _ => {
+                return Err(ZuError::at(
+                    t.pos,
+                    "a declarations fragment may only contain `record` and `enum` declarations",
+                ))
+            }
+        }
+    }
+}
+
 /// Recursion guard for `expr`/`element`: pathological nesting must produce a
 /// clean error, not a compiler stack overflow. Each guarded level fans out
 /// into ~10 precedence/branch frames, so the cap stays well under what a

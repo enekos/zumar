@@ -34,8 +34,8 @@ const GC_JS: &str = include_str!("../../../www/zumar-gc.js");
 const LIVE_JS: &str = include_str!("../../../www/zumar-live.js");
 
 const USAGE: &str = "usage:
-  zuc check <file.zu>
-  zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--zumar <path>]
+  zuc check <file.zu> [--with <decls.zu>]
+  zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--with <decls.zu>] [--zumar <path>]
   zuc new <name>
   zuc dev [<file.zu>] [--backend rust|gc] [--port N] [--zumar <path>]
   zuc assets <www-dir>
@@ -82,7 +82,8 @@ fn run(args: &[String]) -> Result<String, String> {
     match args.first().map(String::as_str) {
         Some("check") => {
             let file = args.get(1).ok_or(USAGE)?;
-            let (app, _) = compile_file(file)?;
+            let with = flag(args, "--with");
+            let (app, _) = compile_file(file, with.as_deref())?;
             Ok(format!(
                 "{file}: ok — app {}, {} model field(s), {} message(s), all handled",
                 app.name,
@@ -93,7 +94,8 @@ fn run(args: &[String]) -> Result<String, String> {
         Some("build") => {
             let file = args.get(1).ok_or(USAGE)?;
             let out = flag(args, "--out").ok_or(USAGE)?;
-            let (app, _) = compile_file(file)?;
+            let with = flag(args, "--with");
+            let (app, _) = compile_file(file, with.as_deref())?;
             match backend(args)? {
                 Backend::Gc => {
                     let bytes = zumar_wasmgc::emit(&app).map_err(|e| format!("{file}:{e}"))?;
@@ -159,9 +161,22 @@ fn deps_fragment(zumar: Option<&Path>) -> String {
 
 // --- compilation with caret diagnostics ----------------------------------
 
-fn compile_file(file: &str) -> Result<(zumar_lang::App, String), String> {
+/// Compile `file`, optionally merging a `record`/`enum` declarations
+/// fragment (`--with`, e.g. a server-generated schema.zu) before the
+/// typecheck. Fragment parse errors carry the fragment's filename.
+fn compile_file(file: &str, with: Option<&str>) -> Result<(zumar_lang::App, String), String> {
     let source = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
-    match zumar_lang::compile(&source) {
+    let result = match with {
+        Some(decls_file) => {
+            let decls_src =
+                std::fs::read_to_string(decls_file).map_err(|e| format!("{decls_file}: {e}"))?;
+            let decls = zumar_lang::parse_decls(&decls_src)
+                .map_err(|e| report(decls_file, &decls_src, &e))?;
+            zumar_lang::compile_with(&source, decls)
+        }
+        None => zumar_lang::compile(&source),
+    };
+    match result {
         Ok(app) => Ok((app, source)),
         Err(e) => Err(report(file, &source, &e)),
     }
@@ -397,7 +412,7 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 /// Returns elapsed seconds.
 fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
     let started = std::time::Instant::now();
-    let (app, _) = compile_file(file)?;
+    let (app, _) = compile_file(file, None)?;
     write_boot(proj, Backend::Rust, &app.name.to_lowercase())?;
     let app_dir = proj.join("app");
     write_crate(&app, &app_dir, deps)?;
@@ -423,7 +438,7 @@ fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
 /// www/pkg/app.wasm. No cargo, no wasm-pack — milliseconds.
 fn build_gc(file: &str, proj: &Path) -> Result<f64, String> {
     let started = std::time::Instant::now();
-    let (app, _) = compile_file(file)?;
+    let (app, _) = compile_file(file, None)?;
     let bytes = zumar_wasmgc::emit(&app).map_err(|e| format!("{file}:{e}"))?;
     let pkg = proj.join("www/pkg");
     std::fs::create_dir_all(&pkg).map_err(|e| e.to_string())?;

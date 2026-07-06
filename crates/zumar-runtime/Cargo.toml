@@ -6,7 +6,14 @@ version.workspace = true
 
 [dependencies]
 zumar-core = { path = "../zumar-core" }
-serde = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde", "zumar-core/serde"]
 
 [dev-dependencies]
 serde_json = { workspace = true }
+
+[[example]]
+name = "wire_bench"
+required-features = ["serde"]

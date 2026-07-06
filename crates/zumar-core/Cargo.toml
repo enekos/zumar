@@ -5,7 +5,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-serde = { workspace = true }
+serde = { workspace = true, optional = true }
+
+[features]
+# JSON-facing derives on the protocol types. The binary wire format never
+# needs them; keep serde out of default builds (and out of servers).
+serde = ["dep:serde"]
 
 [dev-dependencies]
 serde_json = { workspace = true }

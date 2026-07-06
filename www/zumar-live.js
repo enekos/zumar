@@ -53,12 +53,16 @@ class Writer {
 
 // Opens the socket and resolves to a mountable app object once the server's
 // initial render has arrived (so app.init() can answer synchronously).
+// `app.closed` is a promise that settles when the socket later drops —
+// what mountLive's reconnect loop awaits.
 export function connect(url) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(url);
     ws.binaryType = "arraybuffer";
     let initBytes = null;
     let push = null;
+    let onClosed = null;
+    const closed = new Promise((r) => (onClosed = r));
     const send = (w) => ws.send(w.bytes());
 
     const app = {
@@ -96,6 +100,7 @@ export function connect(url) {
       close() {
         ws.close(1000, "");
       },
+      closed,
     };
 
     ws.onmessage = (e) => {
@@ -110,10 +115,50 @@ export function connect(url) {
     ws.onerror = () => reject(new Error(`zumar-live: connection failed: ${url}`));
     ws.onclose = () => {
       if (initBytes === null) reject(new Error("zumar-live: closed before init"));
+      onClosed();
     };
   });
 }
 
-export async function mountLive(url, root) {
-  mount(await connect(url), root);
+// Mount with a persistent session and auto-reconnect. The model lives in
+// the server (and, with a journal, survives the socket): each reconnect
+// carries the same `?session=` id, the server replays the journal, and the
+// page remounts the fresh full render on a clean root. Never returns.
+//
+// opts: sessionKey (localStorage key, default "zumar-live-session"),
+//       session: false to disable the session id entirely.
+export async function mountLive(url, root, opts = {}) {
+  const full = opts.session === false ? url : withSession(url, opts.sessionKey);
+  let attempt = 0;
+  for (;;) {
+    try {
+      const app = await connect(full);
+      attempt = 0;
+      const fresh = root.cloneNode(false); // drop old listeners + children
+      root.replaceWith(fresh);
+      root = fresh;
+      mount(app, root);
+      await app.closed;
+    } catch {
+      // fall through to backoff
+    }
+    attempt += 1;
+    await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** attempt, 5000)));
+  }
+}
+
+function withSession(url, key = "zumar-live-session") {
+  let id = null;
+  try {
+    id = localStorage.getItem(key);
+    if (!id) {
+      id = [...crypto.getRandomValues(new Uint8Array(16))]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      localStorage.setItem(key, id);
+    }
+  } catch {
+    return url; // no storage (file://, privacy mode) → ephemeral session
+  }
+  return url + (url.includes("?") ? "&" : "?") + "session=" + id;
 }

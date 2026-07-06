@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+#[cfg(feature = "serde")]
 use serde::Serialize;
 
 use crate::vdom::VNode;
@@ -7,8 +8,9 @@ use crate::vdom::VNode;
 /// A message-free, serializable snapshot of a subtree — what the JS shim
 /// materializes with `document.createElement`. Events are deliberately
 /// absent: dispatch is resolved vdom-side, so the DOM carries no handlers.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "kind", rename_all = "lowercase"))]
 pub enum SerNode {
     Text {
         text: String,
@@ -37,8 +39,9 @@ impl SerNode {
 /// root (`[]` = the root itself). Patches are emitted in DFS order and are
 /// safe to apply sequentially: a `Replace` ends recursion for its subtree,
 /// and child insertions/removals only ever touch the tail of a child list.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "op", rename_all = "camelCase")]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize))]
+#[cfg_attr(feature = "serde", serde(tag = "op", rename_all = "camelCase"))]
 pub enum Patch {
     Replace {
         path: Vec<u32>,
