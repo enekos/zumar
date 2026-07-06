@@ -1,0 +1,13 @@
+[package]
+name = "zumar-cli"
+description = "zuc — the zumar-lang compiler CLI: check, build, scaffold, and a dev server with live reload. --backend gc emits self-contained WasmGC modules with no rustc in the loop."
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "zuc"
+path = "src/main.rs"
+
+[dependencies]
+zumar-lang = { path = "../zumar-lang" }
+zumar-wasmgc = { path = "../zumar-wasmgc" }

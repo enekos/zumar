@@ -18,13 +18,19 @@ Rust; a WasmGC backend behind the same AST is the long-term goal.
 ## Quick start
 
 ```sh
-export ZUMAR_HOME=/path/to/this/repo
-cargo install --path crates/zumar-lang    # installs zuc
+cargo install --path crates/zumar-cli     # installs zuc
 
 zuc new myapp
 cd myapp
-zuc dev        # http://127.0.0.1:8900, rebuilds on save
+zuc dev --backend gc    # http://127.0.0.1:8900 — millisecond rebuilds,
+                        # no cargo or wasm-pack in the loop
 ```
+
+The GC backend compiles `.zu` straight to a self-contained WasmGC module,
+so a save-to-reload cycle is ~1ms. The default Rust backend (`zuc dev`)
+goes through cargo + wasm-pack and needs `ZUMAR_HOME=/path/to/this/repo`;
+it remains the reference implementation and covers the few things the GC
+backend doesn't yet (enum payload variants, `Maybe`).
 
 Compile errors print where they happened, and the last good build keeps
 serving while you fix them:
@@ -172,7 +178,9 @@ verbatim.
 
 - `crates/zumar-core` — vdom, diff, patch types. No wasm, no DOM.
 - `crates/zumar-runtime` — the model/update/view loop, effects, wire encoding.
-- `crates/zumar-lang` — lexer, parser, typechecker, Rust backend, the `zuc` CLI.
+- `crates/zumar-lang` — lexer, parser, typechecker, Rust backend.
+- `crates/zumar-cli` — the `zuc` CLI: check/build/scaffold + the dev server,
+  with `--backend gc` for rustc-free millisecond rebuilds.
 - `crates/zumar-wasmgc` — the WasmGC backend: `zuc-gc` compiles `.zu`
   straight to a self-contained GC binary via `wasm-encoder` — no Rust
   toolchain, no wasm-bindgen, no runtime. Records are GC structs, lists are
@@ -240,7 +248,8 @@ python3 -m http.server 8765 -d www
    and `%` (`clock.zu`)~~ + ~~effects on the GC backend~~
 9. ~~user-defined sum types + general pattern matching (`kanban.zu`, both
    backends)~~
-10. next: `fold`/lambdas; GC gaps (`Maybe`, enum payloads, Bool payloads,
+10. ~~`zuc dev --backend gc` — millisecond rebuilds~~
+11. next: `fold`/lambdas; GC gaps (`Maybe`, enum payloads, Bool payloads,
     nested `for`).
 
 MIT.

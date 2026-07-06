@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/zumar-cli",
     "crates/zumar-core",
     "crates/zumar-lang",
     "crates/zumar-runtime",

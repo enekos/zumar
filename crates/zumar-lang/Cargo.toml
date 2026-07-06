@@ -4,6 +4,3 @@ description = "zumar-lang v0: an Elm-like language that compiles to zumar TEA ap
 edition.workspace = true
 version.workspace = true
 
-[[bin]]
-name = "zuc"
-path = "src/bin/zuc.rs"

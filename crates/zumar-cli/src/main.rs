@@ -24,16 +24,33 @@ use zumar_lang::ZuError;
 
 // The JS half of the framework ships inside the compiler, so scaffolded
 // projects are self-contained.
-const SHIM_JS: &str = include_str!("../../../../www/zumar.js");
-const WIRE_JS: &str = include_str!("../../../../www/zumar-wire.js");
+const SHIM_JS: &str = include_str!("../../../www/zumar.js");
+const WIRE_JS: &str = include_str!("../../../www/zumar-wire.js");
+const GC_JS: &str = include_str!("../../../www/zumar-gc.js");
 
 const USAGE: &str = "usage:
   zuc check <file.zu>
-  zuc build <file.zu> --out <dir> [--zumar <path>]
-  zuc new <name> [--zumar <path>]
-  zuc dev [<file.zu>] [--port N] [--zumar <path>]
+  zuc build <file.zu> --out <dir|file.wasm> [--backend rust|gc] [--zumar <path>]
+  zuc new <name>
+  zuc dev [<file.zu>] [--backend rust|gc] [--port N] [--zumar <path>]
 
-the zumar repo root is taken from --zumar or $ZUMAR_HOME";
+--backend gc emits a self-contained WasmGC module: no cargo, no wasm-pack,
+millisecond rebuilds. the default rust backend needs the zumar repo root
+(--zumar or $ZUMAR_HOME) and wasm-pack.";
+
+#[derive(Clone, Copy, PartialEq)]
+enum Backend {
+    Rust,
+    Gc,
+}
+
+fn backend(args: &[String]) -> Result<Backend, String> {
+    match flag(args, "--backend").as_deref() {
+        None | Some("rust") => Ok(Backend::Rust),
+        Some("gc") => Ok(Backend::Gc),
+        Some(other) => Err(format!("unknown backend `{other}` (rust or gc)")),
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -64,13 +81,25 @@ fn run(args: &[String]) -> Result<String, String> {
         Some("build") => {
             let file = args.get(1).ok_or(USAGE)?;
             let out = flag(args, "--out").ok_or(USAGE)?;
-            let deps = deps_fragment(zumar_path(args)?.as_deref());
             let (app, _) = compile_file(file)?;
-            let generated = write_crate(&app, Path::new(&out), &deps)?;
-            Ok(format!(
-                "{file}: compiled app {} -> {out}/ (crate `{}`)\nnext: zuc dev, or wasm-pack build {out} --target web",
-                app.name, generated
-            ))
+            match backend(args)? {
+                Backend::Gc => {
+                    let bytes = zumar_wasmgc::emit(&app).map_err(|e| format!("{file}:{e}"))?;
+                    std::fs::write(&out, &bytes).map_err(|e| format!("{out}: {e}"))?;
+                    Ok(format!(
+                        "{file}: emitted WasmGC module -> {out} ({} bytes, self-contained)",
+                        bytes.len()
+                    ))
+                }
+                Backend::Rust => {
+                    let deps = deps_fragment(zumar_path(args)?.as_deref());
+                    let generated = write_crate(&app, Path::new(&out), &deps)?;
+                    Ok(format!(
+                        "{file}: compiled app {} -> {out}/ (crate `{}`)\nnext: zuc dev, or wasm-pack build {out} --target web",
+                        app.name, generated
+                    ))
+                }
+            }
         }
         Some("new") => scaffold(args.get(1).ok_or(USAGE)?),
         Some("dev") => dev(args),
@@ -225,13 +254,7 @@ view =
 </head>
 <body>
   <div id="app"></div>
-  <script type="module">
-    import init, {{ App }} from "./pkg/{crate_name}.js";
-    import {{ mount }} from "./zumar.js";
-
-    await init();
-    mount(new App(), document.getElementById("app"));
-  </script>
+  <script type="module" src="./boot.js"></script>
 </body>
 </html>
 "#
@@ -243,10 +266,13 @@ view =
     std::fs::write(www.join("index.html"), index).map_err(|e| e.to_string())?;
     std::fs::write(www.join("zumar.js"), SHIM_JS).map_err(|e| e.to_string())?;
     std::fs::write(www.join("zumar-wire.js"), WIRE_JS).map_err(|e| e.to_string())?;
-    std::fs::write(root.join(".gitignore"), "app/\nwww/pkg/\n").map_err(|e| e.to_string())?;
+    std::fs::write(www.join("zumar-gc.js"), GC_JS).map_err(|e| e.to_string())?;
+    write_boot(&root, Backend::Rust, &crate_name)?;
+    std::fs::write(root.join(".gitignore"), "app/\nwww/pkg/\nwww/boot.js\n")
+        .map_err(|e| e.to_string())?;
 
     Ok(format!(
-        "created {name}/\n  {name}/{name}.zu       the program\n  {name}/www/           static assets + framework shim\nnext: cd {name} && zuc dev"
+        "created {name}/\n  {name}/{name}.zu       the program\n  {name}/www/           static assets + framework shim\nnext: cd {name} && zuc dev --backend gc   (or plain `zuc dev` for the rust backend)"
     ))
 }
 
@@ -263,7 +289,11 @@ fn dev(args: &[String]) -> Result<String, String> {
             .map_err(|_| format!("--port `{p}` is not a number"))?,
         None => 8900,
     };
-    let deps = deps_fragment(zumar_path(args)?.as_deref());
+    let be = backend(args)?;
+    let deps = match be {
+        Backend::Rust => deps_fragment(zumar_path(args)?.as_deref()),
+        Backend::Gc => String::new(),
+    };
     let proj = std::fs::canonicalize(&file)
         .map_err(|e| format!("{file}: {e}"))?
         .parent()
@@ -277,8 +307,15 @@ fn dev(args: &[String]) -> Result<String, String> {
         ));
     }
 
+    let build = |file: &str, proj: &Path| -> Result<f64, String> {
+        match be {
+            Backend::Rust => build_wasm(file, proj, &deps),
+            Backend::Gc => build_gc(file, proj),
+        }
+    };
+
     // First build must succeed so there is something to serve.
-    build_wasm(&file, &proj, &deps)?;
+    build(&file, &proj)?;
 
     let counter = Arc::new(AtomicU64::new(1));
     {
@@ -286,7 +323,10 @@ fn dev(args: &[String]) -> Result<String, String> {
         let counter = counter.clone();
         std::thread::spawn(move || serve(www, counter, port));
     }
-    println!("zuc dev: serving http://127.0.0.1:{port}  (watching {file}, ctrl-c to stop)");
+    println!(
+        "zuc dev: serving http://127.0.0.1:{port}  ({} backend, watching {file}, ctrl-c to stop)",
+        if be == Backend::Gc { "wasmgc" } else { "rust" }
+    );
 
     // Watch loop: rebuild on .zu save, reload on index.html save.
     let index = www.join("index.html");
@@ -297,10 +337,14 @@ fn dev(args: &[String]) -> Result<String, String> {
         let z = mtime(Path::new(&file));
         if z != zu_stamp {
             zu_stamp = z;
-            match build_wasm(&file, &proj, &deps) {
+            match build(&file, &proj) {
                 Ok(elapsed) => {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    println!("zuc dev: rebuilt in {elapsed:.1}s — reloading");
+                    if elapsed < 0.1 {
+                        println!("zuc dev: rebuilt in {:.0}ms — reloading", elapsed * 1000.0);
+                    } else {
+                        println!("zuc dev: rebuilt in {elapsed:.1}s — reloading");
+                    }
                 }
                 Err(e) => eprintln!("{e}\nzuc dev: still serving the last good build"),
             }
@@ -341,6 +385,7 @@ fn mtime(p: &Path) -> Option<SystemTime> {
 fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
     let started = std::time::Instant::now();
     let (app, _) = compile_file(file)?;
+    write_boot(proj, Backend::Rust, &app.name.to_lowercase())?;
     let app_dir = proj.join("app");
     write_crate(&app, &app_dir, deps)?;
 
@@ -359,6 +404,42 @@ fn build_wasm(file: &str, proj: &Path, deps: &str) -> Result<f64, String> {
         ));
     }
     Ok(started.elapsed().as_secs_f64())
+}
+
+/// The GC-backend build: compile the .zu and emit the module straight to
+/// www/pkg/app.wasm. No cargo, no wasm-pack — milliseconds.
+fn build_gc(file: &str, proj: &Path) -> Result<f64, String> {
+    let started = std::time::Instant::now();
+    let (app, _) = compile_file(file)?;
+    let bytes = zumar_wasmgc::emit(&app).map_err(|e| format!("{file}:{e}"))?;
+    let pkg = proj.join("www/pkg");
+    std::fs::create_dir_all(&pkg).map_err(|e| e.to_string())?;
+    std::fs::write(pkg.join("app.wasm"), &bytes).map_err(|e| e.to_string())?;
+    write_boot(proj, Backend::Gc, &app.name.to_lowercase())?;
+    Ok(started.elapsed().as_secs_f64())
+}
+
+/// www/boot.js is zuc's artifact (index.html imports it): it loads the app
+/// through whichever backend the dev loop is building.
+fn write_boot(proj: &Path, backend: Backend, crate_name: &str) -> Result<(), String> {
+    let boot = match backend {
+        Backend::Rust => format!(
+            r#"// written by zuc (rust backend) — edit index.html, not this file
+import init, {{ App }} from "./pkg/{crate_name}.js";
+import {{ mount }} from "./zumar.js";
+await init();
+mount(new App(), document.getElementById("app"));
+"#
+        ),
+        Backend::Gc => r#"// written by zuc (wasmgc backend) — edit index.html, not this file
+import { mount } from "./zumar.js";
+import { gcApp } from "./zumar-gc.js";
+const { instance } = await WebAssembly.instantiateStreaming(fetch("./pkg/app.wasm"), {});
+mount(gcApp(instance.exports), document.getElementById("app"));
+"#
+        .to_string(),
+    };
+    std::fs::write(proj.join("www/boot.js"), boot).map_err(|e| e.to_string())
 }
 
 // --- the dev server ---------------------------------------------------------
