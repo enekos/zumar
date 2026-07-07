@@ -25,7 +25,7 @@ use zumar_core::{
     collect_events, diff, find_listener, EventPayload, EventSpec, Patch, SerNode, VNode,
 };
 
-pub use effects::{delay, every, every_with_now, http_get, publish, topic};
+pub use effects::{delay, every, every_with_now, http_get, http_post, publish, topic};
 use effects::{
     Cmd, CmdCallback, CmdOut, Cmds, FxPayload, HttpResult, Sub, SubCallback, SubDelta, SubSpec,
 };

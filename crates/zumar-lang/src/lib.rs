@@ -174,8 +174,8 @@ view =
         assert_eq!(app.records.len(), 1);
         assert_eq!(app.msgs.len(), 5);
         // Draft carries a String payload; Add doesn't.
-        assert_eq!(app.msgs[0].payload, Some(ast::Ty::Str));
-        assert_eq!(app.msgs[1].payload, None);
+        assert_eq!(app.msgs[0].payloads, vec![ast::Ty::Str]);
+        assert!(app.msgs[1].payloads.is_empty());
     }
 
     #[test]
@@ -239,7 +239,7 @@ sub = [ topic("room", Tick) ]
 view = div [] []
 "#;
         let err = compile(src).unwrap_err();
-        assert!(err.msg.contains("must take a String payload"), "{err}");
+        assert!(err.msg.contains("must take a single String payload"), "{err}");
     }
 
     #[test]
@@ -299,7 +299,7 @@ view = form [onSubmit Send] [ input [value model.draft, onInput Draft] [] ]
             "update Draft = { draft = \"\" }",
         );
         let err = compile(&src).unwrap_err();
-        assert!(err.msg.contains("must bind the payload"), "{err}");
+        assert!(err.msg.contains("must bind 1 payload"), "{err}");
     }
 
     #[test]
@@ -307,8 +307,57 @@ view = form [onSubmit Send] [ input [value model.draft, onInput Draft] [] ]
         // Toggle takes Int; feeding it a string must fail.
         let src = TODO.replace("onClick Toggle(t.id)", "onClick Toggle(t.text)");
         let err = compile(&src).unwrap_err();
-        assert!(err.msg.contains("argument to `Toggle`"), "{err}");
+        assert!(err.msg.contains("argument 1 to `Toggle`"), "{err}");
     }
+
+    // A drag-painting shape: multi-payload msgs + mouse events — what horma
+    // needed and the language couldn't say (gap-fill 2026-07-07).
+    const PAD: &str = r#"
+app Pad
+model { x: Int, y: Int, painting: Bool }
+init = { x = 0, y = 0, painting = false }
+msg Down Int Int | Over Int Int | Up
+update Down px py = { x = px, y = py, painting = true }
+update Over px py = { x = if model.painting then px else model.x,
+                      y = if model.painting then py else model.y }
+update Up = { painting = false }
+view =
+  div [class "pad", onMouseUp Up] [
+    span [onMouseDown Down(3, 4), onMouseOver Over(3, 4)] [ text show(model.x) ]
+  ]
+"#;
+
+    #[test]
+    fn multi_payload_msgs_and_mouse_events_compile() {
+        let rs = gen_rs(PAD);
+        for needle in [
+            "Down(i64, i64),",
+            "Over(i64, i64),",
+            "Msg::Down(px, py) =>",
+            ".on(\"mousedown\", Msg::Down(3i64, 4i64))",
+            ".on(\"mouseover\", Msg::Over(3i64, 4i64))",
+            ".on(\"mouseup\", Msg::Up)",
+        ] {
+            assert!(rs.contains(needle), "missing {needle:?} in:\n{rs}");
+        }
+    }
+
+    #[test]
+    fn multi_payload_arity_is_checked() {
+        // Wrong arg count at the call site.
+        let src = PAD.replace("Down(3, 4)", "Down(3)");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("needs 2 argument(s) (Int, Int), got 1"), "{err}");
+        // Wrong binder count in the update equation.
+        let src = PAD.replace("update Down px py =", "update Down px =");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("must bind 2 payload(s)"), "{err}");
+        // Wrong arg type, position named.
+        let src = PAD.replace("Down(3, 4)", "Down(3, \"y\")");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("argument 2 to `Down`"), "{err}");
+    }
+
 
     #[test]
     fn oninput_ctor_must_take_string() {
@@ -562,14 +611,67 @@ view =
             "httpGet(\"./quote.txt\", Pong)",
         );
         let err = compile(&src).unwrap_err();
-        assert!(err.msg.contains("must take a String payload"), "{err}");
+        assert!(err.msg.contains("must take a single String payload"), "{err}");
+    }
+
+    const LOGIN: &str = r#"
+app Login
+model { email: String, password: String, status: String }
+init = { email = "", password = "", status = "" }
+msg Email String | Password String | Submit | Result String
+update Email s = { email = s }
+update Password s = { password = s }
+update Submit = { status = "..." } then httpPost("/api/login", "{\"email\":\"" ++ model.email ++ "\"}", Result)
+update Result s = { status = s }
+view =
+  form [onSubmit Submit] [
+    input [type "email", value model.email, onInput Email] [],
+    input [type "password", value model.password, onInput Password] [],
+    button [type "submit"] [ text "log in" ],
+    p [] [ text model.status ]
+  ]
+"#;
+
+    #[test]
+    fn login_form_lowers_httppost() {
+        let rs = gen_rs(LOGIN);
+        for needle in [
+            // the POST cmd binds the pre-update model, builds body with ++
+            "zumar_runtime::http_post(",
+            "\"/api/login\".to_string()",
+            "model.email.clone()", // body concat references the field
+            ", __http_result)",
+            // shares the http callback machinery with httpGet
+            "fn __http_result(r: zumar_runtime::effects::HttpResult) -> Msg {",
+            // onSubmit still prevents default
+            ".on_submit(Msg::Submit)",
+        ] {
+            assert!(rs.contains(needle), "missing {needle:?} in:\n{rs}");
+        }
+    }
+
+    #[test]
+    fn httppost_ctor_must_take_string() {
+        let src = LOGIN.replace(", Result)", ", Submit)");
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("must take a single String payload"), "{err}");
+    }
+
+    #[test]
+    fn httppost_body_must_be_string() {
+        let src = LOGIN.replace(
+            "\"{\\\"email\\\":\\\"\" ++ model.email ++ \"\\\"}\"",
+            "42",
+        );
+        let err = compile(&src).unwrap_err();
+        assert!(err.msg.contains("httpPost body"), "{err}");
     }
 
     #[test]
     fn every_msg_payload_is_none_or_int() {
         let src = CLOCK.replace("every(1000, Tick)", "every(1000, Got)");
         let err = compile(&src).unwrap_err();
-        assert!(err.msg.contains("takes a String"), "{err}");
+        assert!(err.msg.contains("no payload or the clock"), "{err}");
     }
 
     #[test]

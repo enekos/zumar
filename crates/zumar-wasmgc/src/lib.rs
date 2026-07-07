@@ -289,11 +289,12 @@ impl<'a> Emitter<'a> {
             }
         }
         for m in &app.msgs {
-            match &m.payload {
-                None | Some(Ty::Str) | Some(Ty::Int) | Some(Ty::Bool) => {}
-                Some(other) => {
+            match m.payloads.as_slice() {
+                [] | [Ty::Str] | [Ty::Int] | [Ty::Bool] => {}
+                [other] => {
                     return Err(unsupported(m.pos, &format!("`{other}` message payloads")))
                 }
+                _ => return Err(unsupported(m.pos, "multi-payload messages")),
             }
         }
 
@@ -394,6 +395,13 @@ impl<'a> Emitter<'a> {
                 *pos,
                 "publish (live mode only; use --target live)",
             )),
+            // A form's POST body is computed from model fields, which the GC
+            // backend can't encode (same limit as computed httpGet urls).
+            // Build forms with the rust backend (--target wasm or live).
+            CmdCall::HttpPost { pos, .. } => Err(unsupported(
+                *pos,
+                "httpPost (forms need the rust backend; use --target wasm or --target live)",
+            )),
         }
     }
 
@@ -409,7 +417,7 @@ impl<'a> Emitter<'a> {
                     match c {
                         SubCall::Every { ms, msg, .. } => {
                             let msg = self.msg_index(msg);
-                            let clocked = self.app.msgs[msg as usize].payload.is_some();
+                            let clocked = !self.app.msgs[msg as usize].payloads.is_empty();
                             self.sub_sites.push(SubSite {
                                 ms: *ms,
                                 msg,
@@ -597,7 +605,8 @@ impl<'a> Emitter<'a> {
     }
 
     fn msg_payload(&self, index: u32) -> Option<Ty> {
-        self.app.msgs[index as usize].payload.clone()
+        // Multi-payload msgs are gated out in compile(); 0/1 remain.
+        self.app.msgs[index as usize].payloads.first().cloned()
     }
 
     fn event_code(&self, name: &str) -> i32 {
@@ -868,7 +877,7 @@ impl<'a> Emitter<'a> {
                         msg,
                         kind: HandlerKind::Static {
                             takes_input: false,
-                            arg: handler.arg.clone(),
+                            arg: handler.args.first().cloned(),
                         },
                     });
                 }
@@ -918,7 +927,7 @@ impl<'a> Emitter<'a> {
                         kind: HandlerKind::ForItem {
                             region,
                             suffix: suffix.clone(),
-                            arg: handler.arg.clone(),
+                            arg: handler.args.first().cloned(),
                             takes_input: false,
                         },
                     });
@@ -2636,7 +2645,7 @@ impl<'a> Emitter<'a> {
         let mut ins: Vec<I<'static>> = Vec::new();
         for (arm_index, u) in updates.iter().enumerate() {
             let k = self.msg_index(&u.msg);
-            if let Some((v, _)) = &u.var {
+            if let Some((v, _)) = u.vars.first() {
                 let slot = match self.msg_payload(k) {
                     Some(Ty::Str) => Slot::PayloadStr,
                     Some(Ty::Int) => Slot::PayloadInt,
@@ -2668,7 +2677,7 @@ impl<'a> Emitter<'a> {
             }
             ins.push(I::Return);
             ins.push(I::End);
-            if u.var.is_some() {
+            if !u.vars.is_empty() {
                 ctx.env.pop();
             }
         }
@@ -3368,6 +3377,21 @@ view = div [] []
     #[test]
     fn clock_with_effects_emits_a_valid_module() {
         assert_valid(include_str!("../../../examples/lang-clock/clock.zu"));
+    }
+
+    #[test]
+    fn multi_payload_msgs_error_cleanly() {
+        let src = r#"
+app P
+model { x: Int }
+init = { x = 0 }
+msg Down Int Int
+update Down a b = { x = a + b }
+view = div [onMouseDown Down(1, 2)] []
+"#;
+        let app = zumar_lang::compile(src).unwrap();
+        let err = emit(&app).unwrap_err();
+        assert!(err.contains("multi-payload"), "{err}");
     }
 
     #[test]

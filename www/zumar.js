@@ -10,10 +10,19 @@
 
 import { decodeInit, decodeUpdate } from "./zumar-wire.js";
 
-export function mount(app, root) {
+export function mount(app, root, opts = {}) {
   const listening = new Set();
   const preventDefaults = new Map(); // event name -> bool, refreshed per render
   const subHandles = new Map(); // sub id -> interval handle
+
+  // Client-mode auth helpers. Same-origin cookies ride every request (so a
+  // login httpPost's Set-Cookie sticks and later fetches are authenticated);
+  // an optional bearer token covers agent/service clients with no cookie jar.
+  const authInit = (extra) => {
+    const headers = { ...(extra || {}) };
+    if (opts.bearer) headers["Authorization"] = `Bearer ${opts.bearer}`;
+    return { credentials: "same-origin", headers };
+  };
 
   // Every program step (dispatch/resolve/notify) returns the same shape:
   // patches to apply, event specs, commands to run, subscription deltas.
@@ -38,7 +47,17 @@ export function mount(app, root) {
         setTimeout(() => done(), s.ms);
         break;
       case "httpGet":
-        fetch(s.url).then(
+        fetch(s.url, authInit()).then(
+          async (r) => done(r.ok, r.status, await r.text()),
+          (e) => done(false, 0, String(e))
+        );
+        break;
+      case "httpPost":
+        fetch(s.url, {
+          method: "POST",
+          body: s.body,
+          ...authInit({ "Content-Type": "application/json" }),
+        }).then(
           async (r) => done(r.ok, r.status, await r.text()),
           (e) => done(false, 0, String(e))
         );
@@ -77,7 +96,11 @@ export function mount(app, root) {
           spec.name,
           t && "value" in t ? String(t.value) : undefined,
           t && typeof t.checked === "boolean" ? t.checked : undefined,
-          typeof e.key === "string" ? e.key : undefined
+          // the key slot doubles as wheel direction: keyboard events carry
+          // e.key, wheel events carry the sign of e.deltaY as "in"/"out"
+          typeof e.key === "string" ? e.key
+            : typeof e.deltaY === "number" ? (e.deltaY < 0 ? "in" : "out")
+            : undefined
         ));
       });
     }

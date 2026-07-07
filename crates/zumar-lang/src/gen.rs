@@ -178,9 +178,11 @@ impl Gen {
         // Msg.
         o.push_str("#[derive(Clone)]\npub enum Msg {\n");
         for m in &app.msgs {
-            match &m.payload {
-                Some(t) => o.push_str(&format!("    {}({}),\n", m.name, rust_ty(t))),
-                None => o.push_str(&format!("    {},\n", m.name)),
+            if m.payloads.is_empty() {
+                o.push_str(&format!("    {},\n", m.name));
+            } else {
+                let tys: Vec<String> = m.payloads.iter().map(rust_ty).collect();
+                o.push_str(&format!("    {}({}),\n", m.name, tys.join(", ")));
             }
         }
         o.push_str("}\n\n");
@@ -193,7 +195,7 @@ impl Gen {
         o.push_str("}\n\n");
 
         // init.
-        o.push_str("fn init_model() -> Model {\n    Model {\n");
+        o.push_str("pub fn init_model() -> Model {\n    Model {\n");
         for (name, expr, _) in &app.init {
             let want = self.field_ty(MODEL, name);
             let (code, _) = self.emit(expr, Some(&want), &Env::new());
@@ -206,17 +208,17 @@ impl Gen {
         o.push_str("fn update(model: &mut Model, msg: Msg) -> Cmds<Msg> {\n    match msg {\n");
         for u in &app.updates {
             let mut env: Env = vec![("model".into(), Ty::Record(MODEL.into()))];
-            let pat = match &u.var {
-                Some((v, _)) => {
-                    // Recover the payload type from the msg for the env.
-                    if let Some(m) = app.msgs.iter().find(|m| m.name == u.msg) {
-                        if let Some(t) = &m.payload {
-                            env.push((v.clone(), t.clone()));
-                        }
+            let pat = if u.vars.is_empty() {
+                format!("Msg::{}", u.msg)
+            } else {
+                // Recover the payload types from the msg for the env.
+                if let Some(m) = app.msgs.iter().find(|m| m.name == u.msg) {
+                    for ((v, _), t) in u.vars.iter().zip(&m.payloads) {
+                        env.push((v.clone(), t.clone()));
                     }
-                    format!("Msg::{}({})", u.msg, v)
                 }
-                None => format!("Msg::{}", u.msg),
+                let names: Vec<&str> = u.vars.iter().map(|(v, _)| v.as_str()).collect();
+                format!("Msg::{}({})", u.msg, names.join(", "))
             };
             o.push_str(&format!("        {pat} => {{\n"));
             for (name, expr, _) in &u.fields {
@@ -286,12 +288,12 @@ impl Gen {
             "    let __root = {root};\n    VNode::from(__root)\n}}\n\n"
         ));
 
-        let mut program = String::from("Program::new(init_model(), update, view)");
+        let mut tail = String::new();
         if app.subs.is_some() {
-            program.push_str(".with_subscriptions(subs)");
+            tail.push_str(".with_subscriptions(subs)");
         }
         if !app.init_cmds.is_empty() {
-            program.push_str(&format!(
+            tail.push_str(&format!(
                 ".with_init(vec![{}])",
                 self.emit_cmds(&app.init_cmds, &Env::new())
             ));
@@ -299,8 +301,15 @@ impl Gen {
         // The Program constructor is the one seam both targets share: the
         // client build wraps it in the wasm-bindgen `App`; a server (the
         // sutegi-zumar bridge) mounts `program()` directly, per connection.
+        // `program_with(model)` lets a live factory seed per-session state
+        // from the mount request (the authenticated user, query params) —
+        // "session/auth params at mount". `init_model()` is public so a
+        // factory can start from the defaults and override a field or two.
         o.push_str(&format!(
-            "pub fn program() -> zumar_runtime::Program<Model, Msg> {{\n    {program}\n}}\n\n"
+            "pub fn program() -> zumar_runtime::Program<Model, Msg> {{\n    program_with(init_model())\n}}\n\n"
+        ));
+        o.push_str(&format!(
+            "pub fn program_with(model: Model) -> zumar_runtime::Program<Model, Msg> {{\n    Program::new(model, update, view){tail}\n}}\n\n"
         ));
         o.push_str(
             "#[cfg(feature = \"wasm\")]\nzumar_runtime::zumar_app!(App, Model, Msg, program());\n",
@@ -315,7 +324,11 @@ impl Gen {
             .iter()
             .chain(app.updates.iter().flat_map(|u| u.cmds.iter()));
         for cmd in all {
-            if let CmdCall::HttpGet { ctor, .. } = cmd {
+            let ctor = match cmd {
+                CmdCall::HttpGet { ctor, .. } | CmdCall::HttpPost { ctor, .. } => Some(ctor),
+                _ => None,
+            };
+            if let Some(ctor) = ctor {
                 if !ctors.contains(ctor) {
                     ctors.push(ctor.clone());
                 }
@@ -334,7 +347,7 @@ impl Gen {
                             let clocked = app
                                 .msgs
                                 .iter()
-                                .any(|m| &m.name == msg && m.payload.is_some());
+                                .any(|m| &m.name == msg && !m.payloads.is_empty());
                             if clocked && !out.contains(msg) {
                                 out.push(msg.clone());
                             }
@@ -393,6 +406,16 @@ impl Gen {
                         ctor.to_lowercase()
                     )
                 }
+                CmdCall::HttpPost {
+                    url, body, ctor, ..
+                } => {
+                    let (u, _) = self.emit(url, Some(&Ty::Str), env);
+                    let (b, _) = self.emit(body, Some(&Ty::Str), env);
+                    format!(
+                        "zumar_runtime::http_post({u}, {b}, __http_{})",
+                        ctor.to_lowercase()
+                    )
+                }
                 CmdCall::Publish { topic, message, .. } => {
                     let (t, _) = self.emit(topic, Some(&Ty::Str), env);
                     let (m, _) = self.emit(message, Some(&Ty::Str), env);
@@ -413,7 +436,7 @@ impl Gen {
                             let clocked = app
                                 .msgs
                                 .iter()
-                                .any(|m| &m.name == msg && m.payload.is_some());
+                                .any(|m| &m.name == msg && !m.payloads.is_empty());
                             if clocked {
                                 format!(
                                     "zumar_runtime::every_with_now({ms}, __tick_{})",
@@ -532,13 +555,15 @@ impl Gen {
     }
 
     fn emit_msg_call(&self, call: &MsgCall, env: &Env) -> String {
-        match &call.arg {
-            Some(arg) => {
-                let (code, _) = self.emit(arg, None, env);
-                format!("Msg::{}({code})", call.name)
-            }
-            None => format!("Msg::{}", call.name),
+        if call.args.is_empty() {
+            return format!("Msg::{}", call.name);
         }
+        let args: Vec<String> = call
+            .args
+            .iter()
+            .map(|arg| self.emit(arg, None, env).0)
+            .collect();
+        format!("Msg::{}({})", call.name, args.join(", "))
     }
 
     // --- expressions -----------------------------------------------------

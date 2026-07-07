@@ -7,21 +7,23 @@
 //!          | "model" "{" (IDENT ":" ty),* "}"
 //!          | "init" "=" record cmds?
 //!          | "msg" msgitem ("|" msgitem)*
-//!          | "update" IDENT IDENT? "=" record cmds?
+//!          | "update" IDENT IDENT* "=" record cmds?
 //!          | "sub" "=" subexpr
 //!          | "view" "=" element
 //! cmds    := "then" cmdcall ("," cmdcall)*
 //! cmdcall := "delay" "(" INT "," IDENT ")" | "httpGet" "(" expr "," IDENT ")"
+//!          | "httpPost" "(" expr "," expr "," IDENT ")"
 //! subexpr := "if" expr "then" subexpr "else" subexpr
 //!          | "[" ("every" "(" INT "," IDENT ")"),* "]"
-//! msgitem := IDENT ty?
+//! msgitem := IDENT ty*
 //! ty      := "Int" | "String" | "Bool" | "List" ty | "Maybe" ty | IDENT
 //! record  := "{" (IDENT "=" expr),* "}"
 //! element := IDENT "[" attr,* "]" "[" child,* "]"
 //! attr    := "onClick"|"onChange"|"onSubmit" msgcall
+//!          | "onMouseDown"|"onMouseOver"|"onMouseUp" msgcall
 //!          | "onInput"|"onCheck" IDENT
 //!          | IDENT expr
-//! msgcall := IDENT ("(" expr ")")?
+//! msgcall := IDENT ("(" expr ("," expr)* ")")?
 //! child   := "text" expr | "for" IDENT "in" expr "{" element "}" | element
 //! expr    := "if" expr "then" expr "else" expr
 //!          | "for" IDENT "in" expr ("where" expr)? "yield" expr
@@ -249,16 +251,16 @@ impl Parser {
                     "update" => {
                         self.next();
                         let (msg, pos) = self.ident("message name after `update`")?;
-                        let var = match &self.peek().tok {
-                            Tok::Ident(_) => Some(self.ident("payload variable")?),
-                            _ => None,
-                        };
+                        let mut vars = Vec::new();
+                        while matches!(&self.peek().tok, Tok::Ident(_)) {
+                            vars.push(self.ident("payload variable")?);
+                        }
                         self.expect(Tok::Eq)?;
                         let fields = self.record()?;
                         let cmds = self.cmds()?;
                         updates.push(Update {
                             msg,
-                            var,
+                            vars,
                             fields,
                             cmds,
                             pos,
@@ -369,14 +371,18 @@ impl Parser {
 
     fn msg_item(&mut self) -> Result<MsgDef, ZuError> {
         let (name, pos) = self.ident("message name")?;
-        // A payload type follows only if the next token is a type ident that
+        // Payload types follow while the next token is a type ident that
         // isn't a declaration keyword (so `msg Reverse` before `update` is
-        // payload-free).
-        let payload = match &self.peek().tok {
-            Tok::Ident(s) if !KEYWORDS.contains(&s.as_str()) => Some(self.ty()?),
-            _ => None,
-        };
-        Ok(MsgDef { name, payload, pos })
+        // payload-free; `msg Down Int Int` carries two).
+        let mut payloads = Vec::new();
+        while matches!(&self.peek().tok, Tok::Ident(s) if !KEYWORDS.contains(&s.as_str())) {
+            payloads.push(self.ty()?);
+        }
+        Ok(MsgDef {
+            name,
+            payloads,
+            pos,
+        })
     }
 
     fn record(&mut self) -> Result<Record, ZuError> {
@@ -418,7 +424,7 @@ impl Parser {
     }
 
     fn cmd_call(&mut self) -> Result<CmdCall, ZuError> {
-        let (name, pos) = self.ident("a command (delay, httpGet, publish)")?;
+        let (name, pos) = self.ident("a command (delay, httpGet, httpPost, publish)")?;
         match name.as_str() {
             "delay" => {
                 self.expect(Tok::LParen)?;
@@ -436,6 +442,21 @@ impl Parser {
                 self.expect(Tok::RParen)?;
                 Ok(CmdCall::HttpGet { url, ctor, pos })
             }
+            "httpPost" => {
+                self.expect(Tok::LParen)?;
+                let url = self.expr()?;
+                self.expect(Tok::Comma)?;
+                let body = self.expr()?;
+                self.expect(Tok::Comma)?;
+                let (ctor, _) = self.ident("message constructor")?;
+                self.expect(Tok::RParen)?;
+                Ok(CmdCall::HttpPost {
+                    url,
+                    body,
+                    ctor,
+                    pos,
+                })
+            }
             "publish" => {
                 self.expect(Tok::LParen)?;
                 let topic = self.expr()?;
@@ -450,7 +471,7 @@ impl Parser {
             }
             other => Err(ZuError::at(
                 pos,
-                format!("unknown command `{other}` (available: delay, httpGet, publish)"),
+                format!("unknown command `{other}` (available: delay, httpGet, httpPost, publish)"),
             )),
         }
     }
@@ -579,6 +600,23 @@ impl Parser {
                 handler: self.msg_call()?,
                 prevent_default: false,
             }),
+            // Mouse gestures (drag-painting et al.) — the runtime's delegated
+            // events are generic, so these lower to plain event names.
+            "onMouseDown" => Ok(Attr::On {
+                event: "mousedown".into(),
+                handler: self.msg_call()?,
+                prevent_default: false,
+            }),
+            "onMouseOver" => Ok(Attr::On {
+                event: "mouseover".into(),
+                handler: self.msg_call()?,
+                prevent_default: false,
+            }),
+            "onMouseUp" => Ok(Attr::On {
+                event: "mouseup".into(),
+                handler: self.msg_call()?,
+                prevent_default: false,
+            }),
             "onSubmit" => Ok(Attr::On {
                 event: "submit".into(),
                 handler: self.msg_call()?,
@@ -612,15 +650,17 @@ impl Parser {
 
     fn msg_call(&mut self) -> Result<MsgCall, ZuError> {
         let (name, pos) = self.ident("a message")?;
-        let arg = if self.peek().tok == Tok::LParen {
+        let mut args = Vec::new();
+        if self.peek().tok == Tok::LParen {
             self.next();
-            let e = self.expr()?;
+            args.push(self.expr()?);
+            while self.peek().tok == Tok::Comma {
+                self.next();
+                args.push(self.expr()?);
+            }
             self.expect(Tok::RParen)?;
-            Some(e)
-        } else {
-            None
-        };
-        Ok(MsgCall { name, arg, pos })
+        }
+        Ok(MsgCall { name, args, pos })
     }
 
     fn child(&mut self) -> Result<Child, ZuError> {

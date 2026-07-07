@@ -26,7 +26,7 @@
 //!        | 7 path from:varint to:varint  (moveChild)
 //! events = n:(str pd:u8)*n
 //! cmds   = n:(id:varint spec)*n ; spec = 0 ms:varint (delay) | 1 str (httpGet)
-//!        | 2 str str (publish: topic, message)
+//!        | 2 str str (publish: topic, message) | 3 str str (httpPost: url, body)
 //! subs   = n:delta*n ; delta = 0 id:varint spec | 1 id:varint
 //!        ; sub spec = 0 ms:varint (every) | 1 str (topic name)
 //! ```
@@ -191,6 +191,11 @@ fn tail(buf: &mut Vec<u8>, events: &[EventSpec], cmds: &[CmdOut], subs: &[SubDel
                 s(buf, topic);
                 s(buf, message);
             }
+            CmdSpec::HttpPost { url, body } => {
+                buf.push(3);
+                s(buf, url);
+                s(buf, body);
+            }
         }
     }
     vu(buf, subs.len() as u64);
@@ -237,6 +242,35 @@ mod tests {
             }
             assert_eq!(val, n);
         }
+    }
+
+    #[test]
+    fn cmd_specs_encode_with_their_tags() {
+        let up = Update {
+            patches: vec![],
+            events: vec![],
+            cmds: vec![
+                CmdOut {
+                    id: 1,
+                    spec: CmdSpec::HttpGet {
+                        url: "/a".into(),
+                    },
+                },
+                CmdOut {
+                    id: 2,
+                    spec: CmdSpec::HttpPost {
+                        url: "/login".into(),
+                        body: "{}".into(),
+                    },
+                },
+            ],
+            subs: vec![],
+        };
+        let wire = up.to_bytes();
+        // httpGet tag 1 followed later by httpPost tag 3, plus the posted body.
+        assert!(wire.contains(&1u8));
+        assert!(wire.contains(&3u8));
+        assert!(wire.windows(2).any(|w| w == b"{}"));
     }
 
     #[test]

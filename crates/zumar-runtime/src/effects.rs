@@ -30,6 +30,15 @@ pub enum CmdSpec {
     HttpGet {
         url: String,
     },
+    /// POST `body` to `url` — the form-submit primitive. Completes through
+    /// `resolve` exactly like [`HttpGet`](CmdSpec::HttpGet); the callback
+    /// receives the response. In client mode the shim sends the browser's
+    /// cookies (same-origin) so a login POST sets the session; in live mode
+    /// the bridge POSTs from the server, next to the data.
+    HttpPost {
+        url: String,
+        body: String,
+    },
     /// Publish `message` to a pubsub `topic`. Fire-and-forget: no completion
     /// re-enters the program. Only a live-mode host (sutegi-zumar) can act
     /// on it; in client mode the shim warns and drops it (no server bus).
@@ -82,6 +91,23 @@ pub fn delay<Msg>(ms: u32, msg: Msg) -> Cmd<Msg> {
 pub fn http_get<Msg>(url: impl Into<String>, f: fn(HttpResult) -> Msg) -> Cmd<Msg> {
     Cmd {
         spec: CmdSpec::HttpGet { url: url.into() },
+        callback: CmdCallback::WithHttp(f),
+    }
+}
+
+/// POST `body` to `url`; the response arrives through `f`, same shape as
+/// [`http_get`]. The form-submit primitive: a `.zu` `onSubmit` builds the
+/// body from model fields and posts it.
+pub fn http_post<Msg>(
+    url: impl Into<String>,
+    body: impl Into<String>,
+    f: fn(HttpResult) -> Msg,
+) -> Cmd<Msg> {
+    Cmd {
+        spec: CmdSpec::HttpPost {
+            url: url.into(),
+            body: body.into(),
+        },
         callback: CmdCallback::WithHttp(f),
     }
 }

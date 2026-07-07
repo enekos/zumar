@@ -78,6 +78,7 @@ class Reader {
     // publish is live-mode only; a client build decodes it but the shim
     // drops it (no server bus) — see zumar.js.
     if (kind === 2) return { kind: "publish", topic: this.str(), message: this.str() };
+    if (kind === 3) return { kind: "httpPost", url: this.str(), body: this.str() };
     throw new Error(`zumar-wire: unknown cmd kind ${kind}`);
   }
   subSpec() {

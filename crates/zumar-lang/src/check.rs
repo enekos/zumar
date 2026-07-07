@@ -27,7 +27,7 @@ pub fn check(app: &mut App) -> Result<(), ZuError> {
         }
     }
     for m in &mut app.msgs {
-        if let Some(ty) = &mut m.payload {
+        for ty in &mut m.payloads {
             resolve_ty(ty, &enum_names);
         }
     }
@@ -51,7 +51,7 @@ fn resolve_ty(ty: &mut Ty, enums: &BTreeSet<String>) {
 
 struct Checker {
     records: BTreeMap<String, Fields>,
-    msgs: BTreeMap<String, Option<Ty>>,
+    msgs: BTreeMap<String, Vec<Ty>>,
     enums: BTreeMap<String, Vec<(String, Option<Ty>)>>,
     /// Constructor -> owning enum (variants share one namespace).
     variant_owner: BTreeMap<String, String>,
@@ -108,10 +108,10 @@ impl Checker {
 
         let mut msgs = BTreeMap::new();
         for m in &app.msgs {
-            if let Some(ty) = &m.payload {
+            for ty in &m.payloads {
                 check_ty_refs(ty, &names, m.pos)?;
             }
-            if msgs.insert(m.name.clone(), m.payload.clone()).is_some() {
+            if msgs.insert(m.name.clone(), m.payloads.clone()).is_some() {
                 return Err(ZuError::at(
                     m.pos,
                     format!("duplicate message `{}`", m.name),
@@ -206,10 +206,10 @@ impl Checker {
             }
         }
 
-        // updates: known msg, payload var matches, model fields, right types.
+        // updates: known msg, payload vars match arity, model fields, types.
         let mut handled = BTreeSet::new();
         for u in &app.updates {
-            let Some(payload) = self.msgs.get(&u.msg) else {
+            let Some(payloads) = self.msgs.get(&u.msg) else {
                 return Err(ZuError::at(
                     u.pos,
                     format!("`update {}` refers to an undeclared message", u.msg),
@@ -222,24 +222,28 @@ impl Checker {
                 ));
             }
             let mut env: Env = vec![(String::from("model"), Ty::Record(MODEL.into()))];
-            match (payload, &u.var) {
-                (Some(ty), Some((var, _))) => env.push((var.clone(), ty.clone())),
-                (Some(ty), None) => {
-                    return Err(ZuError::at(
-                        u.pos,
+            if u.vars.len() != payloads.len() {
+                let want = payloads
+                    .iter()
+                    .map(|t| t.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(ZuError::at(
+                    u.vars.get(payloads.len()).map(|(_, p)| *p).unwrap_or(u.pos),
+                    if payloads.is_empty() {
+                        format!("message `{}` carries no payload", u.msg)
+                    } else {
                         format!(
-                        "`update {}` must bind the payload: `update {} x = ...` (payload is {ty})",
-                        u.msg, u.msg
-                    ),
-                    ))
-                }
-                (None, Some((_, vpos))) => {
-                    return Err(ZuError::at(
-                        *vpos,
-                        format!("message `{}` carries no payload", u.msg),
-                    ))
-                }
-                (None, None) => {}
+                            "`update {}` must bind {} payload(s) ({want}), got {}",
+                            u.msg,
+                            payloads.len(),
+                            u.vars.len()
+                        )
+                    },
+                ));
+            }
+            for ((var, _), ty) in u.vars.iter().zip(payloads) {
+                env.push((var.clone(), ty.clone()));
             }
             let mut set = BTreeSet::new();
             for (name, expr, pos) in &u.fields {
@@ -297,20 +301,40 @@ impl Checker {
                     *pos,
                     format!("`{msg}` is not a declared message"),
                 )),
-                Some(None) => Ok(()),
-                Some(Some(t)) => Err(ZuError::at(
+                Some(p) if p.is_empty() => Ok(()),
+                Some(p) => Err(ZuError::at(
                     *pos,
-                    format!("delay fires `{msg}` with no payload, but `{msg}` takes a {t}"),
+                    format!(
+                        "delay fires `{msg}` with no payload, but `{msg}` takes a {}",
+                        p[0]
+                    ),
                 )),
             },
             CmdCall::HttpGet { url, ctor, pos } => {
                 self.expect(url, &Ty::Str, env, "httpGet url")?;
                 match self.msgs.get(ctor) {
                     None => Err(ZuError::at(*pos, format!("`{ctor}` is not a declared message"))),
-                    Some(Some(Ty::Str)) => Ok(()),
+                    Some(p) if p.as_slice() == [Ty::Str] => Ok(()),
                     Some(_) => Err(ZuError::at(
                         *pos,
-                        format!("httpGet delivers a String to `{ctor}`, so `{ctor}` must take a String payload"),
+                        format!("httpGet delivers a String to `{ctor}`, so `{ctor}` must take a single String payload"),
+                    )),
+                }
+            }
+            CmdCall::HttpPost {
+                url,
+                body,
+                ctor,
+                pos,
+            } => {
+                self.expect(url, &Ty::Str, env, "httpPost url")?;
+                self.expect(body, &Ty::Str, env, "httpPost body")?;
+                match self.msgs.get(ctor) {
+                    None => Err(ZuError::at(*pos, format!("`{ctor}` is not a declared message"))),
+                    Some(p) if p.as_slice() == [Ty::Str] => Ok(()),
+                    Some(_) => Err(ZuError::at(
+                        *pos,
+                        format!("httpPost delivers a String to `{ctor}`, so `{ctor}` must take a single String payload"),
                     )),
                 }
             }
@@ -334,11 +358,11 @@ impl Checker {
                                     format!("`{msg}` is not a declared message"),
                                 ))
                             }
-                            Some(None) | Some(Some(Ty::Int)) => {}
-                            Some(Some(t)) => {
+                            Some(p) if p.is_empty() || p.as_slice() == [Ty::Int] => {}
+                            Some(_) => {
                                 return Err(ZuError::at(
                                     *pos,
-                                    format!("every fires `{msg}` with no payload or the clock (Int ms), but `{msg}` takes a {t}"),
+                                    format!("every fires `{msg}` with no payload or the clock (Int ms), but `{msg}` takes something else"),
                                 ))
                             }
                         },
@@ -351,11 +375,11 @@ impl Checker {
                                         format!("`{ctor}` is not a declared message"),
                                     ))
                                 }
-                                Some(Some(Ty::Str)) => {}
+                                Some(p) if p.as_slice() == [Ty::Str] => {}
                                 Some(_) => {
                                     return Err(ZuError::at(
                                         *pos,
-                                        format!("topic delivers a String to `{ctor}`, so `{ctor}` must take a String payload"),
+                                        format!("topic delivers a String to `{ctor}`, so `{ctor}` must take a single String payload"),
                                     ))
                                 }
                             }
@@ -392,11 +416,11 @@ impl Checker {
                     };
                     match self.msgs.get(ctor) {
                         None => return Err(ZuError::at(*pos, format!("`{ctor}` is not a declared message"))),
-                        Some(Some(p)) if *p == want => {}
+                        Some(p) if p.as_slice() == [want.clone()] => {}
                         Some(_) => {
                             return Err(ZuError::at(
                                 *pos,
-                                format!("this handler feeds a {want} to `{ctor}`, but `{ctor}` doesn't take a {want} payload"),
+                                format!("this handler feeds a {want} to `{ctor}`, but `{ctor}` doesn't take a single {want} payload"),
                             ))
                         }
                     }
@@ -424,29 +448,41 @@ impl Checker {
     }
 
     fn check_msg_call(&self, call: &MsgCall, env: &Env) -> Result<(), ZuError> {
-        let Some(payload) = self.msgs.get(&call.name) else {
+        let Some(payloads) = self.msgs.get(&call.name) else {
             return Err(ZuError::at(
                 call.pos,
                 format!("`{}` is not a declared message", call.name),
             ));
         };
-        match (payload, &call.arg) {
-            (Some(ty), Some(arg)) => {
-                self.expect(arg, ty, env, &format!("argument to `{}`", call.name))
-            }
-            (Some(ty), None) => Err(ZuError::at(
+        if call.args.len() != payloads.len() {
+            let want = payloads
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(ZuError::at(
                 call.pos,
-                format!(
-                    "`{}` needs a {ty} argument: `{}(...)`",
-                    call.name, call.name
-                ),
-            )),
-            (None, Some(_)) => Err(ZuError::at(
-                call.pos,
-                format!("`{}` takes no argument", call.name),
-            )),
-            (None, None) => Ok(()),
+                if payloads.is_empty() {
+                    format!("`{}` takes no argument", call.name)
+                } else {
+                    format!(
+                        "`{}` needs {} argument(s) ({want}), got {}",
+                        call.name,
+                        payloads.len(),
+                        call.args.len()
+                    )
+                },
+            ));
         }
+        for (i, (arg, ty)) in call.args.iter().zip(payloads).enumerate() {
+            self.expect(
+                arg,
+                ty,
+                env,
+                &format!("argument {} to `{}`", i + 1, call.name),
+            )?;
+        }
+        Ok(())
     }
 
     /// The element type of a `List` expression, or an error at `pos`.

@@ -131,6 +131,15 @@ pub enum CmdCall {
     /// `httpGet(url, Ctor)` — Ctor takes a String: the body on success,
     /// `"error <status>"` on failure.
     HttpGet { url: Expr, ctor: String, pos: Pos },
+    /// `httpPost(url, body, Ctor)` — the form-submit primitive. `body` is a
+    /// String (build it from model fields with `++`); `Ctor` takes the
+    /// response String, same contract as `httpGet`.
+    HttpPost {
+        url: Expr,
+        body: Expr,
+        ctor: String,
+        pos: Pos,
+    },
     /// `publish(topic, message)` — fire-and-forget fan-out to a pubsub topic
     /// (both String). Live-mode only. The pair of a `topic(...)` sub.
     Publish {
@@ -163,7 +172,8 @@ pub enum SubExpr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MsgCall {
     pub name: String,
-    pub arg: Option<Expr>,
+    /// Constructor arguments — `Toggle(t.id)` has one, `Down(x, y)` two.
+    pub args: Vec<Expr>,
     pub pos: Pos,
 }
 
@@ -246,15 +256,16 @@ pub struct RecordDef {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MsgDef {
     pub name: String,
-    pub payload: Option<Ty>,
+    /// Zero or more payload types: `msg Got String | Down Int Int`.
+    pub payloads: Vec<Ty>,
     pub pos: Pos,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Update {
     pub msg: String,
-    /// The bound payload variable, when the message carries one.
-    pub var: Option<(String, Pos)>,
+    /// The bound payload variables, one per payload the message carries.
+    pub vars: Vec<(String, Pos)>,
     pub fields: Record,
     /// Commands requested alongside this update (`... then cmd, cmd`).
     pub cmds: Vec<CmdCall>,

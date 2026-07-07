@@ -113,8 +113,14 @@ export function connect(url) {
       }
     };
     ws.onerror = () => reject(new Error(`zumar-live: connection failed: ${url}`));
-    ws.onclose = () => {
-      if (initBytes === null) reject(new Error("zumar-live: closed before init"));
+    ws.onclose = (e) => {
+      if (initBytes === null) {
+        // Surface the close code so mountLive can stop retrying a policy
+        // rejection (1008 — the server's Live::guard refused this session).
+        const err = new Error("zumar-live: closed before init");
+        err.code = e.code;
+        reject(err);
+      }
       onClosed();
     };
   });
@@ -137,10 +143,16 @@ export async function mountLive(url, root, opts = {}) {
       const fresh = root.cloneNode(false); // drop old listeners + children
       root.replaceWith(fresh);
       root = fresh;
-      mount(app, root);
+      mount(app, root, opts);
       await app.closed;
-    } catch {
-      // fall through to backoff
+    } catch (e) {
+      // A policy close (1008) means Live::guard rejected us — retrying can't
+      // help until the user logs in, so stop rather than spin.
+      if (e && e.code === 1008) {
+        if (opts.onUnauthorized) opts.onUnauthorized();
+        return;
+      }
+      // otherwise fall through to backoff
     }
     attempt += 1;
     await new Promise((r) => setTimeout(r, Math.min(250 * 2 ** attempt, 5000)));
