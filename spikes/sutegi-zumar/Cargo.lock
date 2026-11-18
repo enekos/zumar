@@ -10,42 +10,51 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "sutegi"
-version = "0.5.1"
+version = "0.13.0"
 dependencies = [
+ "sutegi-crypto",
  "sutegi-http",
  "sutegi-json",
+ "sutegi-log",
  "sutegi-web",
  "sutegi-ws",
 ]
 
 [[package]]
 name = "sutegi-crypto"
-version = "0.5.1"
+version = "0.13.0"
 
 [[package]]
 name = "sutegi-http"
-version = "0.5.1"
+version = "0.13.0"
 
 [[package]]
 name = "sutegi-json"
-version = "0.5.1"
+version = "0.13.0"
+
+[[package]]
+name = "sutegi-log"
+version = "0.13.0"
 
 [[package]]
 name = "sutegi-web"
-version = "0.5.1"
+version = "0.13.0"
 dependencies = [
+ "sutegi-crypto",
  "sutegi-http",
  "sutegi-json",
+ "sutegi-log",
  "sutegi-ws",
 ]
 
 [[package]]
 name = "sutegi-ws"
-version = "0.5.1"
+version = "0.13.0"
 dependencies = [
  "libc",
  "sutegi-crypto",
  "sutegi-http",
+ "sutegi-log",
 ]
 
 [[package]]
